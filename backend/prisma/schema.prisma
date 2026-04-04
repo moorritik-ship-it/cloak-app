@@ -1,0 +1,288 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model College {
+  id                 String    @id @default(uuid())
+  name               String
+  domain             String    @unique
+  emailFormatPattern String?   @map("email_format_pattern")
+  isActive           Boolean   @default(true) @map("is_active")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  users              User[]
+  sessions           Session[]
+
+  @@map("colleges")
+}
+
+model User {
+  id                String          @id @default(uuid())
+  collegeId         String          @map("college_id")
+  email             String          @unique
+  firstName         String?         @map("first_name")
+  lastName          String?         @map("last_name")
+  branch            String?
+  year              Int?
+  preferredUsername String?         @map("preferred_username")
+  /** If true, the user appears as Anonymous on college leaderboards. */
+  leaderboardAnonymous Boolean      @default(false) @map("leaderboard_anonymous")
+  cloakScore        Int             @default(0) @map("cloak_score")
+  /** Consecutive IST calendar days with daily login (server-maintained) */
+  cloakStreakDays   Int             @default(0) @map("cloak_streak_days")
+  /** Last IST date (YYYY-MM-DD) we awarded daily login — Asia/Kolkata */
+  lastDailyRewardIstDate String?    @map("last_daily_reward_ist_date") @db.VarChar(10)
+  walletBalance     Decimal         @default(0) @map("wallet_balance") @db.Decimal(10, 2)
+  /** scrypt-derived hash for wallet withdrawals (set via /api/wallet/set-pin) */
+  walletPinHash     String?         @map("wallet_pin_hash") @db.VarChar(128)
+  walletPinSalt     String?         @map("wallet_pin_salt") @db.VarChar(64)
+  /** Admin role flag. Only admins can access /admin + /api/admin/* */
+  isAdmin           Boolean         @default(false) @map("is_admin")
+  isBanned          Boolean         @default(false) @map("is_banned")
+  banExpiresAt      DateTime?       @map("ban_expires_at")
+  themePreference   String          @default("dark") @map("theme_preference")
+  /** If set and in the future, user cannot use Find Match for free; must pay ₹20 queue unlock per session. */
+  freeVideoChatBanUntil DateTime?   @map("free_video_chat_ban_until")
+  createdAt         DateTime        @default(now()) @map("created_at")
+  college           College         @relation(fields: [collegeId], references: [id])
+  sessionsAsUser1   Session[]       @relation("SessionUser1")
+  sessionsAsUser2   Session[]       @relation("SessionUser2")
+  messages          Message[]
+  reportsCreated    Report[]        @relation("ReportReporter")
+  reportsReceived   Report[]        @relation("ReportReportedUser")
+  bans              Ban[]
+  otpCodes                        OtpCode[]
+  otpRequestLogs                  OtpRequestLog[]
+  refreshTokens                   RefreshToken[]
+  communityGuidelinesAcknowledgments CommunityGuidelinesAcknowledgment[]
+  blocksOutgoing                 UserBlock[] @relation("BlocksOutgoing")
+  blocksIncoming                 UserBlock[] @relation("BlocksIncoming")
+  videoChatMessages              VideoChatMessage[]
+  cloakScoreLedger               CloakScoreLedger[]
+  walletTransactions             WalletTransaction[]
+  walletMilestoneAwards          WalletMilestoneAward[]
+
+  @@index([collegeId])
+  @@index([freeVideoChatBanUntil])
+  @@map("users")
+}
+
+/** One row per user per milestone key — prevents double wallet rewards under concurrency */
+model WalletMilestoneAward {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  milestoneKey String   @map("milestone_key") @db.VarChar(16)
+  createdAt    DateTime @default(now()) @map("created_at")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, milestoneKey])
+  @@index([userId])
+  @@map("wallet_milestone_awards")
+}
+
+/** Wallet credits and debits (amount positive = credit, negative = debit) */
+model WalletTransaction {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  amount    Decimal  @db.Decimal(10, 2)
+  reason    String   @db.VarChar(500)
+  type      String   @db.VarChar(32)
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("wallet_transactions")
+}
+
+/** Real-time video match text chat (live + post-session); TTL cleanup in app (24h). */
+model VideoChatMessage {
+  id             String   @id @default(uuid())
+  matchRoomId    String   @map("match_room_id")
+  senderId       String   @map("sender_id")
+  senderUsername String   @map("sender_username") @db.VarChar(64)
+  content        String   @db.VarChar(500)
+  phase          String   @db.VarChar(20)
+  sentAt         DateTime @default(now()) @map("sent_at")
+  sender         User     @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([matchRoomId, sentAt])
+  @@index([sentAt])
+  @@map("video_chat_messages")
+}
+
+model UserBlock {
+  id        String   @id @default(uuid())
+  blockerId String   @map("blocker_id")
+  blockedId String   @map("blocked_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  blocker   User     @relation("BlocksOutgoing", fields: [blockerId], references: [id])
+  blocked   User     @relation("BlocksIncoming", fields: [blockedId], references: [id])
+
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
+  @@index([blockedId])
+  @@map("user_blocks")
+}
+
+model Session {
+  id              String    @id @default(uuid())
+  user1Id         String    @map("user1_id")
+  user2Id         String    @map("user2_id")
+  collegeId       String    @map("college_id")
+  /** Video match room id (Socket.io); unique per live match */
+  matchRoomId     String?   @unique @map("match_room_id")
+  user1Username   String?   @map("user1_username")
+  user2Username   String?   @map("user2_username")
+  startedAt       DateTime  @default(now()) @map("started_at")
+  endedAt         DateTime? @map("ended_at")
+  durationSeconds Int?      @map("duration_seconds")
+  endReason       String?   @map("end_reason")
+  wasExtended     Boolean   @default(false) @map("was_extended")
+  /** 1–5 stars: user1’s rating of the conversation */
+  user1Rating     Int?      @map("user1_rating")
+  user2Rating     Int?      @map("user2_rating")
+  user1Feedback   String?   @map("user1_feedback") @db.VarChar(2000)
+  user2Feedback   String?   @map("user2_feedback") @db.VarChar(2000)
+  /** True once both users were still in the match at the 7:00 hard tick (no Next before that). */
+  reachedSevenMinWithoutSkip Boolean @default(false) @map("reached_seven_min_without_skip")
+  user1PressedNext Boolean @default(false) @map("user1_pressed_next")
+  user2PressedNext Boolean @default(false) @map("user2_pressed_next")
+  /** Active (non-idle) seconds reported by client for CloakScore minute awards, max 420 each */
+  user1EngagedSeconds Int? @map("user1_engaged_seconds")
+  user2EngagedSeconds Int? @map("user2_engaged_seconds")
+  /** Set after CloakScore job runs for this session (idempotent) */
+  cloakRewardsProcessedAt DateTime? @map("cloak_rewards_processed_at")
+  user1           User      @relation("SessionUser1", fields: [user1Id], references: [id])
+  user2           User      @relation("SessionUser2", fields: [user2Id], references: [id])
+  college         College   @relation(fields: [collegeId], references: [id])
+  messages        Message[]
+  reports         Report[]
+  cloakScoreLedger CloakScoreLedger[]
+
+  @@index([user1Id])
+  @@index([user2Id])
+  @@index([collegeId])
+  @@map("sessions")
+}
+
+model CloakScoreLedger {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  delta     Int
+  reason    String   @db.VarChar(64)
+  metadata  Json?
+  sessionId String?  @map("session_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session   Session? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([sessionId])
+  @@map("cloak_score_ledger")
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  sessionId String   @map("session_id")
+  senderId  String   @map("sender_id")
+  content   String
+  phase     String?
+  sentAt    DateTime @default(now()) @map("sent_at")
+  session   Session  @relation(fields: [sessionId], references: [id])
+  sender    User     @relation(fields: [senderId], references: [id])
+
+  @@index([sessionId])
+  @@index([senderId])
+  @@map("messages")
+}
+
+model Report {
+  id             String   @id @default(uuid())
+  reporterId     String   @map("reporter_id")
+  reportedUserId String   @map("reported_user_id")
+  sessionId      String   @map("session_id")
+  category       String
+  description    String?
+  status         String   @default("open")
+  createdAt      DateTime @default(now()) @map("created_at")
+  reporter       User     @relation("ReportReporter", fields: [reporterId], references: [id])
+  reportedUser   User     @relation("ReportReportedUser", fields: [reportedUserId], references: [id])
+  session        Session  @relation(fields: [sessionId], references: [id])
+
+  @@index([reporterId])
+  @@index([reportedUserId])
+  @@index([sessionId])
+  @@map("reports")
+}
+
+model Ban {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  banType   String    @map("ban_type")
+  startedAt DateTime  @default(now()) @map("started_at")
+  expiresAt DateTime? @map("expires_at")
+  isActive  Boolean   @default(true) @map("is_active")
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("bans")
+}
+
+model OtpCode {
+  id         String    @id @default(uuid())
+  userId     String?   @map("user_id")
+  email      String
+  otpHash    String    @map("otp_hash")
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  user       User?     @relation(fields: [userId], references: [id])
+
+  @@index([email])
+  @@index([userId])
+  @@map("otp_codes")
+}
+
+model OtpRequestLog {
+  id        String   @id @default(uuid())
+  userId    String?  @map("user_id")
+  email     String
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([email, createdAt])
+  @@map("otp_request_logs")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/** Audit log: user acknowledged CLOAK community guidelines before connecting */
+model CommunityGuidelinesAcknowledgment {
+  id             String   @id @default(uuid())
+  userId         String   @map("user_id")
+  acknowledgedAt DateTime @default(now()) @map("acknowledged_at")
+  user           User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([acknowledgedAt])
+  @@map("community_guidelines_acknowledgments")
+}
