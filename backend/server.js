@@ -15,12 +15,17 @@ const { createCloakScoreQueue } = require('./cloakScoreQueue')
 dotenv.config()
 
 /**
- * With credentials: true, browsers forbid Access-Control-Allow-Origin: *.
- * Allow any http(s) origin on localhost / 127.0.0.1 / ::1 (any port, e.g. 5173 and 5174).
- * If CLIENT_ORIGIN is set (comma-separated), those origins are also allowed (e.g. production).
+ * CORS + credentials (cookies / Authorization): Allow-Origin must echo the request Origin, never *.
+ *
+ * - No Origin header (same-origin, curl, etc.): allowed.
+ * - Local dev: any http(s) origin whose host is localhost / 127.0.0.1 / ::1 (any port, e.g. Vite 5173).
+ * - Production: set CLIENT_ORIGIN to your deployed frontend URL(s), comma-separated, no trailing slash:
+ *     CLIENT_ORIGIN=https://my-app.vercel.app
+ *     CLIENT_ORIGIN=https://my-app.vercel.app,https://www.example.com
+ *   Optional: include the literal token *.vercel.app to allow any https://*.vercel.app (preview + prod).
  */
 function isLocalhostOrigin(origin) {
-  if (!origin) return true
+  if (!origin) return false
   try {
     const { hostname } = new URL(origin)
     const h = hostname.toLowerCase()
@@ -30,21 +35,62 @@ function isLocalhostOrigin(origin) {
   }
 }
 
+function normalizeCorsOrigin(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\/+$/, '')
+}
+
+function parseClientOriginEntries() {
+  const raw = process.env.CLIENT_ORIGIN
+  if (!raw || !String(raw).trim()) return []
+  return String(raw)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+function isHttpsVercelAppOrigin(origin) {
+  try {
+    const u = new URL(origin)
+    return u.protocol === 'https:' && u.hostname.toLowerCase().endsWith('.vercel.app')
+  } catch {
+    return false
+  }
+}
+
+const CLIENT_ORIGIN_ENTRIES = parseClientOriginEntries()
+if (CLIENT_ORIGIN_ENTRIES.length) {
+  console.log('[cors] CLIENT_ORIGIN allow-list:', CLIENT_ORIGIN_ENTRIES.join(', '))
+} else {
+  console.warn(
+    '[cors] CLIENT_ORIGIN is unset — non-localhost browsers need CLIENT_ORIGIN (e.g. https://your-app.vercel.app)',
+  )
+}
+
 function corsAllowOrigin(origin, callback) {
+  if (!origin) {
+    return callback(null, true)
+  }
+
   if (isLocalhostOrigin(origin)) {
     return callback(null, true)
   }
-  const raw = process.env.CLIENT_ORIGIN
-  if (raw && String(raw).trim()) {
-    const allowed = String(raw)
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-    if (origin && allowed.includes(origin)) {
+
+  const requestOrigin = normalizeCorsOrigin(origin)
+
+  for (const entry of CLIENT_ORIGIN_ENTRIES) {
+    if (entry === '*.vercel.app') {
+      if (isHttpsVercelAppOrigin(origin)) {
+        return callback(null, true)
+      }
+      continue
+    }
+    if (normalizeCorsOrigin(entry) === requestOrigin) {
       return callback(null, true)
     }
   }
-  if (!origin) return callback(null, true)
+
   return callback(new Error('Not allowed by CORS'))
 }
 
@@ -53,7 +99,7 @@ const server = http.createServer(app)
 const io = new Server(server, {
   cors: {
     origin: corsAllowOrigin,
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'OPTIONS'],
     credentials: true,
   },
 })
@@ -160,6 +206,9 @@ app.use(
   cors({
     origin: corsAllowOrigin,
     credentials: true,
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Cookie'],
+    optionsSuccessStatus: 204,
   }),
 )
 app.use(express.json())
