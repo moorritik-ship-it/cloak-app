@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { CHAT_MAX_CHARS, clampChatInput, countGraphemes } from '../utils/chatText.js'
 import { getAccessToken } from '../utils/authStorage.js'
+import { apiUrl } from '../utils/apiBase'
 import ReportUserModal from './ReportUserModal.jsx'
 
 function formatCountdown(ms) {
@@ -414,7 +415,7 @@ export default function VideoChatSessionLayout({
     try {
       const isMockOrder = String(extensionOffer.razorpay_order_id || '').startsWith('mock_')
       if (isMockOrder) {
-        const res = await fetch('/api/payments/razorpay/verify-extension', {
+        const res = await fetch(apiUrl('/api/payments/razorpay/verify-extension'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -448,7 +449,7 @@ export default function VideoChatSessionLayout({
           description: 'Extend video session (7 more minutes)',
           handler: async (response) => {
             try {
-              const res = await fetch('/api/payments/razorpay/verify-extension', {
+              const res = await fetch(apiUrl('/api/payments/razorpay/verify-extension'), {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
@@ -553,7 +554,7 @@ export default function VideoChatSessionLayout({
     setBlockBusy(true)
     setChatError(null)
     try {
-      const res = await fetch('/api/block', {
+      const res = await fetch(apiUrl('/api/block'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1045,13 +1046,19 @@ export default function VideoChatSessionLayout({
 }
 
 function useMemoPostSessionRemaining(expiresAtMs) {
-  const [tick, setTick] = useState(0)
+  const [nowMs, setNowMs] = useState(0)
   useEffect(() => {
     if (expiresAtMs == null) return undefined
-    const id = setInterval(() => setTick((t) => t + 1), 1000)
-    return () => clearInterval(id)
+    const update = () => setNowMs(Date.now())
+    // Update shortly after mount/changes without calling setState synchronously in the effect body.
+    const t0 = setTimeout(update, 0)
+    const id = setInterval(update, 1000)
+    return () => {
+      clearTimeout(t0)
+      clearInterval(id)
+    }
   }, [expiresAtMs])
-  void tick
   if (expiresAtMs == null) return 0
-  return Math.max(0, expiresAtMs - Date.now())
+  if (!nowMs) return 0
+  return Math.max(0, Number(expiresAtMs) - nowMs)
 }

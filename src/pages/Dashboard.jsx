@@ -8,6 +8,7 @@ import AnimatedCloakScore from '../components/AnimatedCloakScore'
 import { useToast } from '../hooks/useToast'
 import { REMEMBERED_DISPLAY_NAME_KEY } from '../utils/sessionDisplayName'
 import { getAccessToken, getUserProfileJson, mergeUserProfile } from '../utils/authStorage'
+import { apiUrl } from '../utils/apiBase'
 
 function formatMoney(value) {
   const n = Number(value)
@@ -87,7 +88,7 @@ function Dashboard() {
 
     const runDailyLogin = async () => {
       try {
-        const res = await fetch('/api/cloak/daily-login', {
+        const res = await fetch(apiUrl('/api/cloak/daily-login'), {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         })
@@ -104,7 +105,7 @@ function Dashboard() {
           for (let i = 0; i < 8; i++) {
             await new Promise((r) => setTimeout(r, 450))
             if (cancelled) return
-            const me = await fetch('/api/me', {
+            const me = await fetch(apiUrl('/api/me'), {
               headers: { Authorization: `Bearer ${token}` },
             })
             const mj = await me.json().catch(() => ({}))
@@ -168,11 +169,11 @@ function Dashboard() {
     const load = async () => {
       try {
         const [dashResp, lbResp] = await Promise.all([
-          fetch('/api/dashboard/summary', {
+          fetch(apiUrl('/api/dashboard/summary'), {
             method: 'GET',
             headers: { Authorization: `Bearer ${token}` },
           }),
-          fetch('/api/leaderboard/college?period=today', {
+          fetch(apiUrl('/api/leaderboard/college?period=today'), {
             method: 'GET',
             headers: { Authorization: `Bearer ${token}` },
           }),
@@ -204,7 +205,7 @@ function Dashboard() {
     let cancelled = false
     ;(async () => {
       try {
-        const me = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } })
+        const me = await fetch(apiUrl('/api/me'), { headers: { Authorization: `Bearer ${token}` } })
         const mj = await me.json().catch(() => ({}))
         if (cancelled || !me.ok) return
         const u = mj?.user
@@ -266,7 +267,7 @@ function Dashboard() {
     if (!token) {
       throw new Error('Not signed in. Please log in again.')
     }
-    const res = await fetch('/api/cloak/guidelines/acknowledge', {
+    const res = await fetch(apiUrl('/api/cloak/guidelines/acknowledge'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { getAccessToken, getUserProfileJson, mergeUserProfile } from '../utils/authStorage'
+import { apiUrl } from '../utils/apiBase'
 
 function readStoredProfile() {
   try {
@@ -34,7 +35,7 @@ function LeaderboardPage() {
     if (!silent) setLoading(true)
     setError('')
     try {
-      const resp = await fetch(`/api/leaderboard/college?period=${encodeURIComponent(p)}`, {
+      const resp = await fetch(apiUrl(`/api/leaderboard/college?period=${encodeURIComponent(p)}`), {
         headers: { Authorization: `Bearer ${token}` },
       })
       const data = await resp.json().catch(() => ({}))
@@ -63,7 +64,7 @@ function LeaderboardPage() {
     let cancelled = false
     const syncMe = async () => {
       try {
-        const resp = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } })
+        const resp = await fetch(apiUrl('/api/me'), { headers: { Authorization: `Bearer ${token}` } })
         const data = await resp.json().catch(() => ({}))
         if (!resp.ok) return
         const u = data?.user
@@ -87,7 +88,7 @@ function LeaderboardPage() {
     const next = !anonymous
     setAnonymous(next)
     try {
-      const resp = await fetch('/api/leaderboard/anonymous', {
+      const resp = await fetch(apiUrl('/api/leaderboard/anonymous'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

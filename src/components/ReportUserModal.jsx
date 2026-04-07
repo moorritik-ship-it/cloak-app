@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { getAccessToken } from '../utils/authStorage.js'
+import { apiUrl } from '../utils/apiBase'
 
 const CATEGORIES = [
   {
@@ -61,7 +62,7 @@ export default function ReportUserModal({ open, onClose, sessionId, reportedUser
     }
     setBusy(true)
     try {
-      const res = await fetch('/api/report', {
+      const res = await fetch(apiUrl('/api/report'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

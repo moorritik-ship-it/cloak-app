@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getAccessToken, mergeUserProfile } from '../utils/authStorage'
+import { apiUrl } from '../utils/apiBase'
 
 const MILESTONE_INFO = [
   { points: 1000, reward: 10 },
@@ -61,7 +62,7 @@ function ProfilePage() {
   const loadWallet = useCallback(async () => {
     const t = getAccessToken()
     if (!t) return
-    const res = await fetch('/api/wallet', { headers: { Authorization: `Bearer ${t}` } })
+    const res = await fetch(apiUrl('/api/wallet'), { headers: { Authorization: `Bearer ${t}` } })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
       setError(data?.message || 'Could not load wallet.')
@@ -79,7 +80,7 @@ function ProfilePage() {
   const loadMe = useCallback(async () => {
     const t = getAccessToken()
     if (!t) return
-    const res = await fetch('/api/me', { headers: { Authorization: `Bearer ${t}` } })
+    const res = await fetch(apiUrl('/api/me'), { headers: { Authorization: `Bearer ${t}` } })
     const data = await res.json().catch(() => ({}))
     if (res.ok && typeof data.user?.cloakScore === 'number') {
       setCloakScore(data.user.cloakScore)
@@ -97,7 +98,7 @@ function ProfilePage() {
     const t = getAccessToken()
     if (!t) return
     try {
-      const res = await fetch('/api/blocks', { headers: { Authorization: `Bearer ${t}` } })
+      const res = await fetch(apiUrl('/api/blocks'), { headers: { Authorization: `Bearer ${t}` } })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) return
       if (typeof data.supportEmail === 'string' && data.supportEmail) setSupportEmail(data.supportEmail)
@@ -118,7 +119,7 @@ function ProfilePage() {
     setMessage(null)
     setBusy(true)
     try {
-      const res = await fetch('/api/wallet/set-pin', {
+      const res = await fetch(apiUrl('/api/wallet/set-pin'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -147,7 +148,7 @@ function ProfilePage() {
     setBusy(true)
     try {
       const amt = Number(topupInr)
-      const res = await fetch('/api/wallet/topup-order', {
+      const res = await fetch(apiUrl('/api/wallet/topup-order'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -160,7 +161,7 @@ function ProfilePage() {
 
       const orderId = data.order_id
       if (String(orderId).startsWith('mock_wt_')) {
-        const v = await fetch('/api/wallet/topup-verify', {
+        const v = await fetch(apiUrl('/api/wallet/topup-verify'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -192,7 +193,7 @@ function ProfilePage() {
           description: 'Wallet top-up',
           handler: async (response) => {
             try {
-              const v = await fetch('/api/wallet/topup-verify', {
+              const v = await fetch(apiUrl('/api/wallet/topup-verify'), {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
@@ -238,7 +239,7 @@ function ProfilePage() {
     setMessage(null)
     setBusy(true)
     try {
-      const res = await fetch('/api/wallet/withdraw', {
+      const res = await fetch(apiUrl('/api/wallet/withdraw'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

@@ -4,6 +4,7 @@ import { io } from 'socket.io-client'
 import VideoChatWebRTC from '../components/VideoChatWebRTC'
 import VideoChatSessionLayout from '../components/VideoChatSessionLayout'
 import { getAccessToken, getUserProfileJson } from '../utils/authStorage'
+import { getApiBase, apiUrl } from '../utils/apiBase'
 
 const SUPPORT_EMAIL =
   (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CLOAK_SUPPORT_EMAIL) ||
@@ -118,7 +119,7 @@ function VideoChatPage() {
     setBanPayError(null)
     setQueueUnlockBusy(true)
     try {
-      const res = await fetch('/api/payments/razorpay/queue-unlock-order', {
+      const res = await fetch(apiUrl('/api/payments/razorpay/queue-unlock-order'), {
         method: 'POST',
         headers: { Authorization: `Bearer ${tok}` },
       })
@@ -126,7 +127,7 @@ function VideoChatPage() {
       if (!res.ok) throw new Error(data.message || 'Could not start payment')
       const orderId = data.order_id
       if (String(orderId).startsWith('mock_qu_')) {
-        const v = await fetch('/api/payments/razorpay/verify-queue-unlock', {
+        const v = await fetch(apiUrl('/api/payments/razorpay/verify-queue-unlock'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
           body: JSON.stringify({
@@ -153,7 +154,7 @@ function VideoChatPage() {
           description: 'Unlock one Find Match session (₹20)',
           handler: async (response) => {
             try {
-              const v = await fetch('/api/payments/razorpay/verify-queue-unlock', {
+              const v = await fetch(apiUrl('/api/payments/razorpay/verify-queue-unlock'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
                 body: JSON.stringify({
@@ -193,7 +194,7 @@ function VideoChatPage() {
       return undefined
     }
 
-    const socket = io('/', {
+    const socket = io(getApiBase() || '/', {
       path: '/socket.io',
       auth: { token },
       transports: ['websocket', 'polling'],

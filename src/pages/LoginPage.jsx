@@ -4,10 +4,10 @@ import { AnimatePresence, motion as Motion } from 'framer-motion'
 import LoginParticles from '../components/LoginParticles'
 import { setAuthSession } from '../utils/authStorage'
 import { isLoginEmailAllowed, normalizeEmailForLogin } from '../utils/loginEmail'
+import { apiUrl } from '../utils/apiBase'
 
 const OTP_LENGTH = 6
 const TIMER_SECONDS = 5 * 60
-const OTP_API_BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 const otpContainerVariants = {
   hidden: {},
@@ -89,7 +89,7 @@ function LoginPage() {
   }
 
   const requestOtp = async (submittedEmail) => {
-    const response = await fetch(`${OTP_API_BASE}/auth/request-otp`, {
+    const response = await fetch(apiUrl('/auth/request-otp'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -105,7 +105,7 @@ function LoginPage() {
   }
 
   const verifyOtp = async (submittedEmail, submittedOtp) => {
-    const response = await fetch(`${OTP_API_BASE}/auth/verify-otp`, {
+    const response = await fetch(apiUrl('/auth/verify-otp'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',

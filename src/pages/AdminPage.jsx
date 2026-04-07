@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getAccessToken, getUserProfileJson, mergeUserProfile } from '../utils/authStorage'
+import { apiUrl } from '../utils/apiBase'
 
 function readStoredProfile() {
   try {
@@ -48,7 +49,7 @@ export default function AdminPage() {
     let cancelled = false
     ;(async () => {
       try {
-        const res = await fetch('/api/me', { headers: { Authorization: `Bearer ${token}` } })
+        const res = await fetch(apiUrl('/api/me'), { headers: { Authorization: `Bearer ${token}` } })
         const data = await res.json().catch(() => ({}))
         if (cancelled) return
         if (!res.ok) throw new Error(data?.message || 'Could not load profile.')
@@ -57,7 +58,7 @@ export default function AdminPage() {
         if (!data.user?.isAdmin) {
           navigate('/dashboard')
         }
-      } catch (e) {
+      } catch {
         if (!cancelled) navigate('/dashboard')
       }
     })()
@@ -68,7 +69,7 @@ export default function AdminPage() {
 
   const api = async (path, opts = {}) => {
     setError('')
-    const res = await fetch(path, {
+    const res = await fetch(apiUrl(path), {
       ...opts,
       headers: {
         ...(opts.headers || {}),
