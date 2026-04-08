@@ -51,6 +51,13 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
   /** @type {Map<string, NodeJS.Timeout>} */
   const queueTimeouts = new Map()
 
+  /**
+   * In-memory fallback queue used when Redis isn't configured.
+   * This still matches across devices as long as you run a single backend instance.
+   * @type {Map<string, Array<{ socketId: string, userId: string, username: string, collegeId: string, joinedAt: number }>>}
+   */
+  const memQueues = new Map()
+
   /** room_id -> { sockets: [socketId, socketId] } for WebRTC signaling */
   const activeMatchRooms = new Map()
 
@@ -138,11 +145,17 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    * @param {string} socketId
    */
   async function removeSocketFromQueue(collegeId, socketId) {
-    if (!redis) return
+    clearQueueTimeout(socketId)
+    if (!redis) {
+      const q = memQueues.get(collegeId) || []
+      const next = q.filter((e) => e.socketId !== socketId)
+      if (next.length) memQueues.set(collegeId, next)
+      else memQueues.delete(collegeId)
+      return
+    }
     const queueKey = `${QUEUE_PREFIX}${collegeId}`
     await redis.lrem(queueKey, 1, socketId)
     await redis.del(`${SOCKET_META_PREFIX}${socketId}`)
-    clearQueueTimeout(socketId)
     const len = await redis.llen(queueKey)
     if (len === 0) {
       await redis.srem(ACTIVE_COLLEGES_KEY, collegeId)
@@ -153,7 +166,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    * @param {import('socket.io').Socket} socket
    */
   async function handleDisconnect(socket) {
-    if (!redis || !socket.data?.inQueue || !socket.data?.collegeId) return
+    if (!socket.data?.inQueue || !socket.data?.collegeId) return
     await removeSocketFromQueue(socket.data.collegeId, socket.id)
     socket.data.inQueue = false
   }
@@ -955,10 +968,6 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    * @returns {Promise<boolean>}
    */
   async function enqueueSocket(socket, username) {
-    if (!redis) {
-      socket.emit('queue_error', { message: 'Matching unavailable (Redis not configured).' })
-      return false
-    }
     const trimmed = typeof username === 'string' ? username.trim() : ''
     if (trimmed.length < 2 || trimmed.length > 20) {
       socket.emit('queue_error', { message: 'Invalid username for queue.' })
@@ -1014,7 +1023,6 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       return false
     }
 
-    const queueKey = `${QUEUE_PREFIX}${collegeId}`
     const meta = {
       socketId: socket.id,
       userId,
@@ -1023,9 +1031,16 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       joinedAt: Date.now(),
     }
     try {
-      await redis.rpush(queueKey, socket.id)
-      await redis.set(`${SOCKET_META_PREFIX}${socket.id}`, JSON.stringify(meta))
-      await redis.sadd(ACTIVE_COLLEGES_KEY, collegeId)
+      if (!redis) {
+        const q = memQueues.get(collegeId) || []
+        q.push(meta)
+        memQueues.set(collegeId, q)
+      } else {
+        const queueKey = `${QUEUE_PREFIX}${collegeId}`
+        await redis.rpush(queueKey, socket.id)
+        await redis.set(`${SOCKET_META_PREFIX}${socket.id}`, JSON.stringify(meta))
+        await redis.sadd(ACTIVE_COLLEGES_KEY, collegeId)
+      }
       socket.data.inQueue = true
       socket.data.queueUsername = trimmed
 
@@ -1052,8 +1067,111 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
     }
   }
 
+  async function tryMatchCollegeInMemory(collegeId) {
+    const q = memQueues.get(collegeId) || []
+    if (q.length < 2) return
+
+    for (let i = 0; i < q.length; i += 1) {
+      for (let j = i + 1; j < q.length; j += 1) {
+        const A = q[i]
+        const B = q[j]
+        if (!(await canMatchPair(A, B))) continue
+
+        // Remove matched pair from queue.
+        const next = q.filter((e) => e.socketId !== A.socketId && e.socketId !== B.socketId)
+        if (next.length) memQueues.set(collegeId, next)
+        else memQueues.delete(collegeId)
+
+        clearQueueTimeout(A.socketId)
+        clearQueueTimeout(B.socketId)
+
+        const roomId = crypto.randomUUID()
+        const aIsOfferer = A.userId < B.userId
+        const payloadA = {
+          room_id: roomId,
+          peer_username: B.username,
+          peer_user_id: B.userId,
+          is_offerer: aIsOfferer,
+        }
+        const payloadB = {
+          room_id: roomId,
+          peer_username: A.username,
+          peer_user_id: A.userId,
+          is_offerer: !aIsOfferer,
+        }
+
+        // Cooldown is Redis-backed; without Redis we skip this persistence.
+        const sessionStartMs = Date.now()
+        const matchRoom = {
+          sockets: [A.socketId, B.socketId],
+          userIds: [A.userId, B.userId],
+          sessionStartMs,
+          timers: [],
+          hardEndTimer: null,
+          extended: false,
+          extensionState: null,
+          dbSessionId: null,
+          liveSessionEnded: false,
+          cloakEngagedSeconds: {},
+        }
+
+        if (prisma) {
+          try {
+            const u1 = A.userId < B.userId ? A : B
+            const u2 = A.userId < B.userId ? B : A
+            const row = await prisma.session.create({
+              data: {
+                user1Id: u1.userId,
+                user2Id: u2.userId,
+                collegeId: collegeId,
+                user1Username: u1.username.slice(0, 64),
+                user2Username: u2.username.slice(0, 64),
+                matchRoomId: roomId,
+              },
+            })
+            matchRoom.dbSessionId = row.id
+            payloadA.session_id = row.id
+            payloadB.session_id = row.id
+          } catch (e) {
+            console.error('[matching] session create (mem):', e)
+          }
+        }
+
+        activeMatchRooms.set(roomId, matchRoom)
+        scheduleMatchRoomLifecycle(roomId)
+
+        payloadA.session_start_at_ms = sessionStartMs
+        payloadA.session_end_at_ms = sessionStartMs + SESSION_LIVE_MS
+        payloadB.session_start_at_ms = sessionStartMs
+        payloadB.session_end_at_ms = sessionStartMs + SESSION_LIVE_MS
+
+        io.to(A.socketId).emit('match_found', payloadA)
+        io.to(B.socketId).emit('match_found', payloadB)
+
+        const sockA = io.sockets.sockets.get(A.socketId)
+        const sockB = io.sockets.sockets.get(B.socketId)
+        if (sockA) sockA.data.inQueue = false
+        if (sockB) sockB.data.inQueue = false
+
+        // Continue matching same college if more people are waiting.
+        await tryMatchCollegeInMemory(collegeId)
+        return
+      }
+    }
+  }
+
   async function runMatchingTick() {
-    if (!redis) return
+    if (!redis) {
+      const colleges = [...memQueues.keys()]
+      for (const collegeId of colleges) {
+        try {
+          await tryMatchCollegeInMemory(collegeId)
+        } catch (err) {
+          console.error('[matching] tryMatchCollege (mem) error:', collegeId, err)
+        }
+      }
+      return
+    }
     const colleges = await redis.smembers(ACTIVE_COLLEGES_KEY)
     if (!colleges?.length) return
     for (const collegeId of colleges) {
@@ -1067,7 +1185,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
 
   let intervalId = null
   function startMatcherLoop() {
-    if (intervalId || !redis) return
+    if (intervalId) return
     intervalId = setInterval(runMatchingTick, MATCH_INTERVAL_MS)
   }
 
@@ -1101,9 +1219,6 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
 
     socket.on('skip_match', async (payload) => {
       try {
-        if (!redis) {
-          return socket.emit('skip_error', { message: 'Matching unavailable (Redis not configured).' })
-        }
         const roomId = payload?.room_id
         if (!roomId || typeof roomId !== 'string') {
           return socket.emit('skip_error', { message: 'room_id required.' })
