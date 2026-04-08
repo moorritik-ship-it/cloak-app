@@ -105,7 +105,7 @@ const io = new Server(server, {
 })
 
 const prisma = new PrismaClient()
-const PORT = Number(process.env.PORT) || 4000
+const PORT = Number.parseInt(process.env.PORT || '', 10) || 4000
 
 let upstashRedis = null
 if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
@@ -466,12 +466,21 @@ async function sendOtpWithResend(email, otp) {
   }
 }
 
-app.get('/health', async (req, res) => {
+/**
+ * Fast health check for load balancers.
+ * Must return immediately (no DB/Redis dependency) so platforms like Render don't time out startup.
+ */
+app.get('/health', (req, res) => {
+  return res.status(200).json({ status: 'ok' })
+})
+
+/** Optional deeper checks */
+app.get('/health/db', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`
-    return res.status(200).json({ status: 'ok' })
+    return res.status(200).json({ db: 'ok' })
   } catch (error) {
-    return res.status(500).json({ status: 'error', message: 'Database connection failed' })
+    return res.status(503).json({ db: 'error' })
   }
 })
 
@@ -1132,43 +1141,52 @@ async function deleteExpiredVideoChatMessages() {
   }
 }
 
-async function startServer() {
-  deleteExpiredVideoChatMessages().catch(() => {})
-  setInterval(() => {
-    deleteExpiredVideoChatMessages()
-  }, 60 * 60 * 1000)
-
-  if (upstashRedis) {
-    const result = await verifyUpstashRedis()
-    if (result.ok) {
-      console.log('[matching] Upstash Redis: PING OK — connection verified')
-    } else {
-      console.error(
-        '[matching] Upstash Redis: PING failed —',
-        result.reason,
-        result.error || result.pong || '',
-      )
-    }
-  }
-
+function startServer() {
+  // Start listening immediately (don't block on DB/Redis).
   server.listen(PORT, () => {
-    console.log(`Backend server running on http://localhost:${PORT}`)
+    console.log(`Backend server listening on port ${PORT}`)
+
+    // Background initialization after the server is already accepting traffic.
+    setImmediate(() => {
+      // Prisma connect (non-blocking)
+      prisma
+        .$connect()
+        .then(() => {
+          console.log('Prisma connected to PostgreSQL')
+        })
+        .catch((error) => {
+          console.error('Prisma connection failed:', error?.message || error)
+        })
+
+      // Redis ping (non-blocking)
+      if (upstashRedis) {
+        verifyUpstashRedis()
+          .then((result) => {
+            if (result.ok) {
+              console.log('[matching] Upstash Redis: PING OK — connection verified')
+            } else {
+              console.error(
+                '[matching] Upstash Redis: PING failed —',
+                result.reason,
+                result.error || result.pong || '',
+              )
+            }
+          })
+          .catch((e) => {
+            console.error('[matching] Upstash Redis: PING failed —', e?.message || e)
+          })
+      }
+
+      // TTL cleanup loop (non-blocking)
+      deleteExpiredVideoChatMessages().catch(() => {})
+      setInterval(() => {
+        deleteExpiredVideoChatMessages()
+      }, 60 * 60 * 1000)
+    })
   })
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err)
-  process.exit(1)
-})
-
-prisma
-  .$connect()
-  .then(() => {
-    console.log('Prisma connected to PostgreSQL')
-  })
-  .catch((error) => {
-    console.error('Prisma connection failed. Update DATABASE_URL for Supabase:', error.message)
-  })
+startServer()
 
 process.on('SIGINT', async () => {
   await prisma.$disconnect()
