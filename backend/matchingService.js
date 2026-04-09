@@ -37,6 +37,12 @@ const QUEUE_PAID_UNLOCK_PREFIX = 'matching:queue_paid_unlock:'
 /** Test override: allow these accounts to match regardless of collegeId */
 const TEST_MATCH_EMAILS = new Set(['moorritik@gmail.com', 'moorritik6@gmail.com'])
 const TEST_COLLEGE_ID = '__test__'
+const DEBUG_MATCHING = process.env.DEBUG_MATCHING === '1'
+
+function isTestCollegeId(collegeId) {
+  const c = String(collegeId || '').trim().toLowerCase()
+  return c === TEST_COLLEGE_ID || c === 'test'
+}
 
 /**
  * @param {string} a
@@ -768,6 +774,8 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    */
   async function canMatchPair(a, b) {
     if (a.userId === b.userId) return false
+    // Test override: when both users are in the test queue, bypass block/cooldown checks.
+    if (isTestCollegeId(a.collegeId) && isTestCollegeId(b.collegeId)) return true
     if (await areBlockedPair(a.userId, b.userId)) return false
     if (await inRecentMatchCooldown(a.userId, b.userId)) return false
     return true
@@ -780,6 +788,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
     if (!redis) return
     const queueKey = `${QUEUE_PREFIX}${collegeId}`
     const len = await redis.llen(queueKey)
+    if (DEBUG_MATCHING) console.log('[matching] tryMatchCollege', { collegeId, len })
     if (len < 2) return
 
     const socketIds = await redis.lrange(queueKey, 0, len - 1)
@@ -815,7 +824,21 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       for (let j = i + 1; j < entries.length; j += 1) {
         const A = entries[i]
         const B = entries[j]
-        if (!(await canMatchPair(A, B))) continue
+        const ok = await canMatchPair(A, B)
+        if (!ok) {
+          if (DEBUG_MATCHING) {
+            const blocked = await areBlockedPair(A.userId, B.userId)
+            const cooldown = await inRecentMatchCooldown(A.userId, B.userId)
+            console.log('[matching] pair_rejected', {
+              collegeId,
+              A: { userId: A.userId, socketId: A.socketId },
+              B: { userId: B.userId, socketId: B.socketId },
+              blocked,
+              cooldown,
+            })
+          }
+          continue
+        }
 
         await redis.lrem(queueKey, 1, A.socketId)
         await redis.lrem(queueKey, 1, B.socketId)
@@ -1046,11 +1069,26 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         const q = memQueues.get(collegeId) || []
         q.push(meta)
         memQueues.set(collegeId, q)
+        console.log('[matching] queued', {
+          mode: 'memory',
+          collegeId,
+          socketId: socket.id,
+          userId,
+          queueLen: q.length,
+        })
       } else {
         const queueKey = `${QUEUE_PREFIX}${collegeId}`
         await redis.rpush(queueKey, socket.id)
         await redis.set(`${SOCKET_META_PREFIX}${socket.id}`, JSON.stringify(meta))
         await redis.sadd(ACTIVE_COLLEGES_KEY, collegeId)
+        const qlen = await redis.llen(queueKey)
+        console.log('[matching] queued', {
+          mode: 'redis',
+          collegeId,
+          socketId: socket.id,
+          userId,
+          queueLen: qlen,
+        })
       }
       socket.data.inQueue = true
       socket.data.queueUsername = trimmed
@@ -1179,8 +1217,13 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
   }
 
   async function runMatchingTick() {
+    if (DEBUG_MATCHING) {
+      runMatchingTick._n = (runMatchingTick._n || 0) + 1
+      if (runMatchingTick._n % 20 === 0) console.log('[matching] matcher_tick', { redis: Boolean(redis) })
+    }
     if (!redis) {
       const colleges = [...memQueues.keys()]
+      if (DEBUG_MATCHING) console.log('[matching] matcher_colleges', { count: colleges.length, colleges })
       for (const collegeId of colleges) {
         try {
           await tryMatchCollegeInMemory(collegeId)
@@ -1191,6 +1234,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       return
     }
     const colleges = await redis.smembers(ACTIVE_COLLEGES_KEY)
+    if (DEBUG_MATCHING) console.log('[matching] matcher_colleges', { count: colleges?.length || 0, colleges })
     if (!colleges?.length) return
     for (const collegeId of colleges) {
       try {
@@ -1205,6 +1249,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
   function startMatcherLoop() {
     if (intervalId) return
     intervalId = setInterval(runMatchingTick, MATCH_INTERVAL_MS)
+    console.log('[matching] matcher_loop_started', { intervalMs: MATCH_INTERVAL_MS, redis: Boolean(redis) })
   }
 
   io.use((socket, next) => {
