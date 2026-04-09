@@ -34,6 +34,10 @@ const FREE_VIDEO_BAN_DAYS = 7
 /** One-shot: after ₹20 Razorpay verify, user may join queue once while banned */
 const QUEUE_PAID_UNLOCK_PREFIX = 'matching:queue_paid_unlock:'
 
+/** Test override: allow these accounts to match regardless of collegeId */
+const TEST_MATCH_EMAILS = new Set(['moorritik@gmail.com', 'moorritik6@gmail.com'])
+const TEST_COLLEGE_ID = '__test__'
+
 /**
  * @param {string} a
  * @param {string} b
@@ -884,6 +888,13 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
 
         io.to(A.socketId).emit('match_found', payloadA)
         io.to(B.socketId).emit('match_found', payloadB)
+        console.log('[matching] match_found', {
+          roomId,
+          collegeId,
+          A: { socketId: A.socketId, userId: A.userId, username: A.username },
+          B: { socketId: B.socketId, userId: B.userId, username: B.username },
+          via: 'redis',
+        })
 
         const sockA = io.sockets.sockets.get(A.socketId)
         const sockB = io.sockets.sockets.get(B.socketId)
@@ -1147,6 +1158,13 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
 
         io.to(A.socketId).emit('match_found', payloadA)
         io.to(B.socketId).emit('match_found', payloadB)
+        console.log('[matching] match_found', {
+          roomId,
+          collegeId,
+          A: { socketId: A.socketId, userId: A.userId, username: A.username },
+          B: { socketId: B.socketId, userId: B.userId, username: B.username },
+          via: 'memory',
+        })
 
         const sockA = io.sockets.sockets.get(A.socketId)
         const sockB = io.sockets.sockets.get(B.socketId)
@@ -1200,8 +1218,10 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
     }
     try {
       const payload = jwt.verify(token, accessTokenSecret)
+      const email = typeof payload?.email === 'string' ? payload.email.trim().toLowerCase() : ''
       socket.data.userId = payload.sub
-      socket.data.collegeId = payload.collegeId
+      socket.data.collegeId =
+        email && TEST_MATCH_EMAILS.has(email) ? TEST_COLLEGE_ID : payload.collegeId
       socket.data.inQueue = false
       return next()
     } catch {
@@ -1214,6 +1234,11 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
 
     socket.on('join_queue', async (payload) => {
       const username = typeof payload?.username === 'string' ? payload.username.trim() : ''
+      console.log('[matching] join_queue', {
+        socketId: socket.id,
+        userId: socket.data?.userId,
+        collegeId: socket.data?.collegeId,
+      })
       await enqueueSocket(socket, username)
     })
 
