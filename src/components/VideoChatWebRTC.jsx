@@ -241,6 +241,8 @@ export default function VideoChatWebRTC({
     const stream = processedStreamRef.current || localStreamRef.current
     if (!stream) return
 
+    console.log('[video-chat] WebRTC starting', { roomId, peerUserId, isOfferer })
+
     answererIceBufferRef.current = []
     offererIceBufferRef.current = []
     answerAppliedRef.current = false
@@ -367,7 +369,7 @@ export default function VideoChatWebRTC({
       setConnPhase('failed')
     }
 
-    const onPeerDisconnected = () => {
+    const onPeerDisconnectedEvt = () => {
       destroyPeer()
       setConnPhase('failed')
       setFailureReason('The other participant disconnected.')
@@ -378,7 +380,7 @@ export default function VideoChatWebRTC({
     socket.on('webrtc_answer_relay', onAnswerRelay)
     socket.on('ice_candidate_relay', onIceRelay)
     socket.on('room_error', onRoomError)
-    socket.on('webrtc_peer_disconnected', onPeerDisconnected)
+    socket.on('webrtc_peer_disconnected', onPeerDisconnectedEvt)
 
     if (isOfferer) {
       const peer = new Peer({
@@ -396,7 +398,7 @@ export default function VideoChatWebRTC({
       socket.off('webrtc_answer_relay', onAnswerRelay)
       socket.off('ice_candidate_relay', onIceRelay)
       socket.off('room_error', onRoomError)
-      socket.off('webrtc_peer_disconnected', onPeerDisconnected)
+      socket.off('webrtc_peer_disconnected', onPeerDisconnectedEvt)
       destroyPeer()
     }
   }, [socket, roomId, peerUserId, mediaError, isOfferer, emitSignal, destroyPeer, onPeerDisconnected, retryKey])

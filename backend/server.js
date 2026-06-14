@@ -11,8 +11,24 @@ const { PrismaClient, Prisma } = require('@prisma/client')
 const { Redis } = require('@upstash/redis')
 const { createMatchingService } = require('./matchingService')
 const { createCloakScoreQueue } = require('./cloakScoreQueue')
+const {
+  assertDatabaseEnv,
+  logDatabaseEnvDiagnostics,
+  createPrismaClient,
+} = require('./lib/dbConfig')
 
 dotenv.config()
+
+try {
+  assertDatabaseEnv()
+  logDatabaseEnvDiagnostics()
+} catch (dbEnvError) {
+  console.error('[database] Configuration error:', dbEnvError?.message || dbEnvError)
+  console.error(
+    '[database] On Render, set DATABASE_URL to your Supabase transaction pooler (port 6543, user postgres.<project-ref>, host aws-0-<region>.pooler.supabase.com, ?pgbouncer=true). URL-encode special characters in the password.',
+  )
+  process.exit(1)
+}
 
 /**
  * CORS + credentials (cookies / Authorization): Allow-Origin must echo the request Origin, never *.
@@ -104,7 +120,7 @@ const io = new Server(server, {
   },
 })
 
-const prisma = new PrismaClient()
+const prisma = createPrismaClient()
 const PORT = Number.parseInt(process.env.PORT || '', 10) || 4000
 
 let upstashRedis = null
@@ -199,6 +215,7 @@ const matching = createMatchingService({
   redis: upstashRedis,
   accessTokenSecret: ACCESS_TOKEN_SECRET,
   cloakQueue,
+  whitelistTestEmails: WHITELIST_TEST_EMAILS,
 })
 
 app.use(helmet())

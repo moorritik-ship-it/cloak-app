@@ -34,14 +34,24 @@ const FREE_VIDEO_BAN_DAYS = 7
 /** One-shot: after ₹20 Razorpay verify, user may join queue once while banned */
 const QUEUE_PAID_UNLOCK_PREFIX = 'matching:queue_paid_unlock:'
 
-/** Test override: allow these accounts to match regardless of collegeId */
-const TEST_MATCH_EMAILS = new Set(['moorritik@gmail.com', 'moorritik6@gmail.com'])
-const TEST_COLLEGE_ID = '__test__'
-const DEBUG_MATCHING = process.env.DEBUG_MATCHING === '1'
+/** Fallback when server does not pass whitelistTestEmails */
+const TEST_MATCH_EMAILS_FALLBACK = new Set(['moorritik@gmail.com', 'moorritik6@gmail.com'])
+/** Test queue bucket — all test / whitelist users share this collegeId for matching */
+const TEST_COLLEGE_ID = 'test'
+
+/**
+ * Single queue key for test college aliases so `test` and `__test__` users match together.
+ * @param {string} collegeId
+ */
+function normalizeQueueCollegeId(collegeId) {
+  const c = String(collegeId || '').trim()
+  const lower = c.toLowerCase()
+  if (lower === '__test__' || lower === 'test') return TEST_COLLEGE_ID
+  return c
+}
 
 function isTestCollegeId(collegeId) {
-  const c = String(collegeId || '').trim().toLowerCase()
-  return c === TEST_COLLEGE_ID || c === 'test'
+  return normalizeQueueCollegeId(collegeId) === TEST_COLLEGE_ID
 }
 
 /**
@@ -57,7 +67,11 @@ function pairCooldownKey(a, b) {
  * @param {import('@upstash/redis').Redis | null} redis
  * @param {{ enqueueSessionRewards?: (sessionId: string) => void } | null | undefined} cloakQueue
  */
-function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueue }) {
+function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueue, whitelistTestEmails }) {
+  const testMatchEmails =
+    whitelistTestEmails instanceof Set
+      ? whitelistTestEmails
+      : new Set(TEST_MATCH_EMAILS_FALLBACK)
   /** @type {Map<string, NodeJS.Timeout>} */
   const queueTimeouts = new Map()
 
@@ -161,7 +175,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    */
   async function removeSocketFromQueue(collegeId, socketId) {
     clearQueueTimeout(socketId)
-    const key = String(collegeId || '')
+    const key = normalizeQueueCollegeId(collegeId)
     if (!key) return
     const arr = waitingUsers[key]
     if (!Array.isArray(arr) || arr.length === 0) return
@@ -783,10 +797,10 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    * @param {string} collegeId
    */
   async function tryMatchCollege(collegeId) {
-    const key = String(collegeId || '')
+    const key = normalizeQueueCollegeId(collegeId)
     const q = waitingUsers[key]
     const len = Array.isArray(q) ? q.length : 0
-    console.log('[matching] tryMatchCollege', { collegeId: key, queueLen: len })
+    console.log('[matching] tryMatchCollege', { collegeId: key, queueLen: len, socketIds: (q || []).map((u) => u.socketId) })
     if (!Array.isArray(q) || q.length < 2) return
 
     while (q.length >= 2) {
@@ -863,19 +877,27 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       payloadB.session_start_at_ms = sessionStartMs
       payloadB.session_end_at_ms = sessionStartMs + SESSION_LIVE_MS
 
-      console.log('[matching] emit_match_found', { roomId, collegeId: key, A: A.socketId, B: B.socketId })
-      io.to(A.socketId).emit('match_found', payloadA)
-      io.to(B.socketId).emit('match_found', payloadB)
-      console.log('[matching] match_found', {
+      console.log('[matching] emitting match_found', {
         roomId,
         collegeId: key,
-        A: { socketId: A.socketId, userId: A.userId, username: A.username },
-        B: { socketId: B.socketId, userId: B.userId, username: B.username },
-        via: 'waitingUsers',
+        toSocketIds: [A.socketId, B.socketId],
+        userIds: [A.userId, B.userId],
+      })
+      io.to(A.socketId).emit('match_found', payloadA)
+      io.to(B.socketId).emit('match_found', payloadB)
+      console.log('[matching] match_found emitted', {
+        roomId,
+        collegeId: key,
+        socketA: A.socketId,
+        socketB: B.socketId,
+        userA: A.userId,
+        userB: B.userId,
       })
 
       sockA.data.inQueue = false
       sockB.data.inQueue = false
+      sockA.data.matchRoomId = roomId
+      sockB.data.matchRoomId = roomId
     }
 
     // Clean up empty arrays.
@@ -965,7 +987,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       socket.emit('queue_error', { message: 'Already in queue.' })
       return false
     }
-    const collegeId = socket.data.collegeId
+    const collegeId = normalizeQueueCollegeId(socket.data.collegeId)
     const userId = socket.data.userId
     if (!collegeId || !userId) {
       socket.emit('queue_error', { message: 'Missing session.' })
@@ -1019,7 +1041,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       joinedAt: Date.now(),
     }
     try {
-      const key = String(collegeId || '')
+      const key = collegeId
       if (!key) {
         socket.emit('queue_error', { message: 'Missing college.' })
         return false
@@ -1028,7 +1050,14 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       if (!Array.isArray(waitingUsers[key])) waitingUsers[key] = []
       waitingUsers[key].push(meta)
       const qlen = waitingUsers[key].length
-      console.log('[matching] queued', { collegeId: key, socketId: socket.id, userId, queueLen: qlen })
+      console.log('[matching] user_joined_queue', {
+        collegeId: key,
+        socketId: socket.id,
+        userId,
+        username: trimmed,
+        queueLen: qlen,
+        waitingSocketIds: waitingUsers[key].map((u) => u.socketId),
+      })
       socket.data.inQueue = true
       socket.data.queueUsername = trimmed
 
@@ -1070,10 +1099,17 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
     try {
       const payload = jwt.verify(token, accessTokenSecret)
       const email = typeof payload?.email === 'string' ? payload.email.trim().toLowerCase() : ''
+      const rawCollegeId =
+        email && testMatchEmails.has(email) ? TEST_COLLEGE_ID : payload.collegeId
       socket.data.userId = payload.sub
-      socket.data.collegeId =
-        email && TEST_MATCH_EMAILS.has(email) ? TEST_COLLEGE_ID : payload.collegeId
+      socket.data.collegeId = normalizeQueueCollegeId(rawCollegeId)
       socket.data.inQueue = false
+      console.log('[matching] socket_authenticated', {
+        socketId: socket.id,
+        userId: socket.data.userId,
+        collegeId: socket.data.collegeId,
+        email: email || undefined,
+      })
       return next()
     } catch {
       return next(new Error('Unauthorized'))
@@ -1089,6 +1125,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         socketId: socket.id,
         userId: socket.data?.userId,
         collegeId: socket.data?.collegeId,
+        username,
       })
       await enqueueSocket(socket, username)
     })
@@ -1185,7 +1222,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
     })
 
     socket.on('leave_queue', async () => {
-      if (!redis || !socket.data.inQueue || !socket.data.collegeId) return
+      if (!socket.data.inQueue || !socket.data.collegeId) return
       await removeSocketFromQueue(socket.data.collegeId, socket.id)
       socket.data.inQueue = false
     })

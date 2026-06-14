@@ -194,13 +194,18 @@ function VideoChatPage() {
       return undefined
     }
 
-    const socket = io(getApiBase() || '/', {
+    const apiBase = getApiBase() || '/'
+    console.log('[video-chat] socket.io connecting to', apiBase, { path: '/socket.io' })
+
+    const socket = io(apiBase, {
       path: '/socket.io',
       auth: { token },
       transports: ['websocket', 'polling'],
+      reconnection: true,
     })
 
     const onConnect = () => {
+      console.log('[video-chat] socket connected', socket.id)
       setClientSocket(socket)
       setMatchPayload(null)
       setStagedMatch(null)
@@ -212,11 +217,19 @@ function VideoChatPage() {
     }
 
     const onJoinedQueue = () => {
+      console.log('[video-chat] joined_queue')
       setPhase('waiting')
       setFreeVideoBan(null)
     }
 
     const onMatchFound = (data) => {
+      console.log('[video-chat] match_found received', {
+        room_id: data?.room_id,
+        peer_user_id: data?.peer_user_id,
+        peer_username: data?.peer_username,
+        is_offerer: data?.is_offerer,
+        socketId: socket.id,
+      })
       setSessionNotice(null)
       setStagedMatch(data)
       setCountdownDigit(3)
@@ -252,6 +265,7 @@ function VideoChatPage() {
     }
 
     const onConnectError = (err) => {
+      console.error('[video-chat] socket connect_error', err?.message || err)
       setPhase('error')
       setErrorMessage(err?.message || 'Could not connect to the matchmaking server.')
     }
@@ -335,6 +349,10 @@ function VideoChatPage() {
     if (countdownDigit === 0) {
       const sm = stagedMatch
       if (sm) {
+        console.log('[video-chat] countdown complete — entering matched phase', {
+          room_id: sm.room_id,
+          peer_user_id: sm.peer_user_id,
+        })
         setMatchPayload(sm)
         setPhase('matched')
       }
@@ -461,20 +479,22 @@ function VideoChatPage() {
   const inCallShell =
     clientSocket && (phase === 'waiting' || phase === 'matched' || phase === 'countdown')
 
+  const activeMatch = matchPayload ?? stagedMatch
+
   if (inCallShell) {
     const partnerLabel =
       phase === 'countdown'
-        ? 'Match found!'
-        : matchPayload?.peer_username ?? 'Searching…'
+        ? stagedMatch?.peer_username || 'Match found!'
+        : activeMatch?.peer_username ?? 'Searching…'
     const nextLocked = skipLockoutUntil != null && Date.now() < skipLockoutUntil
 
     return (
       <div className="video-chat-page video-chat-page--call-mode max-w-[100vw] overflow-x-hidden">
         <VideoChatSessionLayout
-          roomId={matchPayload?.room_id ?? null}
-          sessionEndAtMs={matchPayload?.session_end_at_ms ?? null}
-          sessionId={matchPayload?.session_id ?? null}
-          partnerUserId={matchPayload?.peer_user_id ?? null}
+          roomId={activeMatch?.room_id ?? null}
+          sessionEndAtMs={activeMatch?.session_end_at_ms ?? null}
+          sessionId={activeMatch?.session_id ?? null}
+          partnerUserId={activeMatch?.peer_user_id ?? null}
           currentUserId={currentUserId}
           partnerUsername={partnerLabel}
           displayName={displayName}
@@ -494,9 +514,9 @@ function VideoChatPage() {
         >
           <VideoChatWebRTC
             socket={clientSocket}
-            roomId={matchPayload?.room_id ?? null}
-            peerUserId={matchPayload?.peer_user_id ?? null}
-            isOfferer={matchPayload ? computeIsOfferer(matchPayload) : false}
+            roomId={activeMatch?.room_id ?? null}
+            peerUserId={activeMatch?.peer_user_id ?? null}
+            isOfferer={activeMatch ? computeIsOfferer(activeMatch) : false}
             micMuted={micMuted}
             cameraOff={cameraOff}
             localVideoFilter={filterMode}
