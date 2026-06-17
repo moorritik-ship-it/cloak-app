@@ -4,17 +4,12 @@ import MatchingParticles from './MatchingParticles.jsx'
 import MatchCountdownOverlay from './MatchCountdownOverlay.jsx'
 import { useCloakEngagement } from '../hooks/useCloakEngagement.js'
 import { FILTERS, useCanvasVideoFilters } from '../hooks/useCanvasVideoFilters.js'
-
-const ICE_SERVERS = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
-}
+import { ICE_SERVERS } from '../utils/iceServers.js'
 
 /**
  * @param {object} props
  * @param {import('socket.io-client').Socket} props.socket
+ * @param {object} [props.iceConfig] — RTCPeerConnection ICE config (STUN + TURN)
  * @param {string | null} props.roomId
  * @param {string | null} props.peerUserId
  * @param {boolean} props.isOfferer
@@ -29,6 +24,7 @@ const ICE_SERVERS = {
  */
 export default function VideoChatWebRTC({
   socket,
+  iceConfig = ICE_SERVERS,
   roomId,
   peerUserId,
   isOfferer,
@@ -315,7 +311,7 @@ export default function VideoChatWebRTC({
         initiator: false,
         trickle: true,
         stream,
-        config: ICE_SERVERS,
+        config: iceConfig,
       })
       peerRef.current = peer
       attachPeerHandlers(peer)
@@ -387,7 +383,7 @@ export default function VideoChatWebRTC({
         initiator: true,
         trickle: true,
         stream,
-        config: ICE_SERVERS,
+        config: iceConfig,
       })
       peerRef.current = peer
       attachPeerHandlers(peer)
@@ -401,7 +397,7 @@ export default function VideoChatWebRTC({
       socket.off('webrtc_peer_disconnected', onPeerDisconnectedEvt)
       destroyPeer()
     }
-  }, [socket, roomId, peerUserId, mediaError, isOfferer, emitSignal, destroyPeer, onPeerDisconnected, retryKey])
+  }, [socket, roomId, peerUserId, mediaError, isOfferer, emitSignal, destroyPeer, onPeerDisconnected, retryKey, iceConfig])
 
   const handleRetry = () => {
     destroyPeer()

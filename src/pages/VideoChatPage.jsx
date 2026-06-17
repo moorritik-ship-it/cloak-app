@@ -5,6 +5,7 @@ import VideoChatWebRTC from '../components/VideoChatWebRTC'
 import VideoChatSessionLayout from '../components/VideoChatSessionLayout'
 import { getAccessToken, getUserProfileJson } from '../utils/authStorage'
 import { getApiBase, apiUrl } from '../utils/apiBase'
+import { ICE_SERVERS } from '../utils/iceServers'
 
 const SUPPORT_EMAIL =
   (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CLOAK_SUPPORT_EMAIL) ||
@@ -514,6 +515,7 @@ function VideoChatPage() {
         >
           <VideoChatWebRTC
             socket={clientSocket}
+            iceConfig={ICE_SERVERS}
             roomId={activeMatch?.room_id ?? null}
             peerUserId={activeMatch?.peer_user_id ?? null}
             isOfferer={activeMatch ? computeIsOfferer(activeMatch) : false}
