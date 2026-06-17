@@ -256,6 +256,48 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
   }
 
   /**
+   * @param {{ webrtcBuffer?: { offer: object | null, answer: object | null, candidates: Array<{ fromSocketId: string, candidate: object }> } }} room
+   */
+  function ensureWebRtcBuffer(room) {
+    if (!room.webrtcBuffer) {
+      room.webrtcBuffer = { offer: null, answer: null, candidates: [] }
+    }
+    return room.webrtcBuffer
+  }
+
+  /**
+   * Replay SDP/ICE already exchanged so a peer that joined late still completes handshake.
+   * @param {object} room
+   * @param {string} roomId
+   * @param {string} socketId
+   */
+  function replayWebRtcBufferToSocket(room, roomId, socketId) {
+    const buf = room.webrtcBuffer
+    if (!buf) return
+    const sock = io.sockets.sockets.get(socketId)
+    if (!sock) return
+    let replayed = 0
+    if (buf.offer && buf.offer.fromSocketId !== socketId) {
+      sock.emit('webrtc_offer_relay', { room_id: roomId, sdp: buf.offer.sdp })
+      replayed += 1
+      console.log('[webrtc] replay offer ->', socketId, { roomId, from: buf.offer.fromSocketId })
+    }
+    if (buf.answer && buf.answer.fromSocketId !== socketId) {
+      sock.emit('webrtc_answer_relay', { room_id: roomId, sdp: buf.answer.sdp })
+      replayed += 1
+      console.log('[webrtc] replay answer ->', socketId, { roomId, from: buf.answer.fromSocketId })
+    }
+    for (const entry of buf.candidates) {
+      if (entry.fromSocketId === socketId) continue
+      sock.emit('ice_candidate_relay', { room_id: roomId, candidate: entry.candidate })
+      replayed += 1
+    }
+    if (replayed > 0) {
+      console.log('[webrtc] replayed signals', { roomId, to: socketId, count: replayed })
+    }
+  }
+
+  /**
    * @param {import('socket.io').Socket} fromSocket
    * @param {string} roomId
    * @param {string} eventName
@@ -263,9 +305,20 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    */
   function relayToPeer(fromSocket, roomId, eventName, payload) {
     const room = activeMatchRooms.get(roomId)
-    if (!room || !room.sockets.includes(fromSocket.id)) return
+    if (!room || !room.sockets.includes(fromSocket.id)) {
+      console.warn('[webrtc] relay skipped — not in room', {
+        eventName,
+        roomId,
+        from: fromSocket.id,
+      })
+      return
+    }
     const other = room.sockets.find((id) => id !== fromSocket.id)
-    if (!other) return
+    if (!other) {
+      console.warn('[webrtc] relay skipped — no peer', { eventName, roomId, from: fromSocket.id })
+      return
+    }
+    console.log('[webrtc] relay', { eventName, roomId, from: fromSocket.id, to: other })
     io.to(other).emit(eventName, payload)
   }
 
@@ -846,6 +899,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         dbSessionId: null,
         liveSessionEnded: false,
         cloakEngagedSeconds: {},
+        webrtcBuffer: { offer: null, answer: null, candidates: [] },
       }
 
       // Optional DB record (non-blocking for match emit)
@@ -1236,9 +1290,60 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         return socket.emit('room_error', { message: 'Invalid or expired room.' })
       }
       socket.data.matchRoomId = roomId
+      console.log('[webrtc] join_match_room', { socketId: socket.id, roomId })
+      replayWebRtcBufferToSocket(room, roomId, socket.id)
     })
 
-    /** CloakScore: client sends engaged seconds per tick (max +5s); idle detection is client-side */
+    socket.on('webrtc_request_signals', ({ room_id: roomId }) => {
+      if (!roomId || typeof roomId !== 'string') return
+      const room = activeMatchRooms.get(roomId)
+      if (!room || !room.sockets.includes(socket.id)) return
+      console.log('[webrtc] request_signals', { socketId: socket.id, roomId })
+      replayWebRtcBufferToSocket(room, roomId, socket.id)
+    })
+
+    socket.on('webrtc_offer', (data) => {
+      const { room_id: roomId, sdp } = data || {}
+      if (!roomId || !sdp) return
+      const room = activeMatchRooms.get(roomId)
+      if (room) {
+        const buf = ensureWebRtcBuffer(room)
+        buf.offer = { sdp, fromSocketId: socket.id }
+        console.log('[webrtc] offer stored', { roomId, from: socket.id, type: sdp?.type })
+      }
+      relayToPeer(socket, roomId, 'webrtc_offer_relay', { room_id: roomId, sdp })
+    })
+
+    socket.on('webrtc_answer', (data) => {
+      const { room_id: roomId, sdp } = data || {}
+      if (!roomId || !sdp) return
+      const room = activeMatchRooms.get(roomId)
+      if (room) {
+        const buf = ensureWebRtcBuffer(room)
+        buf.answer = { sdp, fromSocketId: socket.id }
+        console.log('[webrtc] answer stored', { roomId, from: socket.id, type: sdp?.type })
+      }
+      relayToPeer(socket, roomId, 'webrtc_answer_relay', { room_id: roomId, sdp })
+    })
+
+    socket.on('ice_candidate', (data) => {
+      const { room_id: roomId, candidate } = data || {}
+      if (!roomId || candidate == null) return
+      const room = activeMatchRooms.get(roomId)
+      if (room) {
+        const buf = ensureWebRtcBuffer(room)
+        if (buf.candidates.length < 200) {
+          buf.candidates.push({ fromSocketId: socket.id, candidate })
+        }
+        console.log('[webrtc] ice_candidate stored', {
+          roomId,
+          from: socket.id,
+          type: candidate?.type,
+          buffered: buf.candidates.length,
+        })
+      }
+      relayToPeer(socket, roomId, 'ice_candidate_relay', { room_id: roomId, candidate })
+    })
     socket.on('cloak_engagement_delta', (payload) => {
       const roomId = payload?.room_id
       const delta = Number(payload?.delta_seconds)
@@ -1252,24 +1357,6 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       if (!room.cloakEngagedSeconds) room.cloakEngagedSeconds = {}
       const prev = room.cloakEngagedSeconds[userId] || 0
       room.cloakEngagedSeconds[userId] = Math.min(7 * 60, prev + capped)
-    })
-
-    socket.on('webrtc_offer', (data) => {
-      const { room_id: roomId, sdp } = data || {}
-      if (!roomId || !sdp) return
-      relayToPeer(socket, roomId, 'webrtc_offer_relay', { room_id: roomId, sdp })
-    })
-
-    socket.on('webrtc_answer', (data) => {
-      const { room_id: roomId, sdp } = data || {}
-      if (!roomId || !sdp) return
-      relayToPeer(socket, roomId, 'webrtc_answer_relay', { room_id: roomId, sdp })
-    })
-
-    socket.on('ice_candidate', (data) => {
-      const { room_id: roomId, candidate } = data || {}
-      if (!roomId || candidate == null) return
-      relayToPeer(socket, roomId, 'ice_candidate_relay', { room_id: roomId, candidate })
     })
 
     socket.on('chat_history_request', async ({ room_id: roomId }) => {

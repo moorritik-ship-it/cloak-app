@@ -43,4 +43,5 @@ export const ICE_SERVERS = {
     },
   ],
   iceCandidatePoolSize: 10,
+  sdpSemantics: 'unified-plan',
 }

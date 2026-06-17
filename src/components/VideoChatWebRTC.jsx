@@ -6,6 +6,40 @@ import { useCloakEngagement } from '../hooks/useCloakEngagement.js'
 import { FILTERS, useCanvasVideoFilters } from '../hooks/useCanvasVideoFilters.js'
 import { ICE_SERVERS } from '../utils/iceServers.js'
 
+const CONNECT_TIMEOUT_MS = 25_000
+const MAX_AUTO_RETRIES = 4
+const OFFER_REQUEST_DELAY_MS = 2_500
+
+/** @param {object} iceConfig */
+function buildPeerRtcConfig(iceConfig, role) {
+  const servers = iceConfig?.iceServers?.length ?? 0
+  const turnServers = (iceConfig?.iceServers || []).filter((s) => {
+    const urls = Array.isArray(s.urls) ? s.urls.join(' ') : String(s.urls || '')
+    return urls.includes('turn:') || urls.includes('turns:')
+  }).length
+  console.log('[video-chat] simple-peer config', { role, iceServers: servers, turnServers, sdpSemantics: iceConfig?.sdpSemantics })
+  return {
+    sdpSemantics: 'unified-plan',
+    ...iceConfig,
+  }
+}
+
+/** @param {object} signal */
+function describeSignal(signal) {
+  if (!signal || typeof signal !== 'object') return { kind: 'unknown' }
+  if (signal.type === 'offer' || signal.type === 'answer') {
+    return { kind: signal.type }
+  }
+  if (signal.candidate) {
+    const c = String(signal.candidate.candidate || signal.candidate)
+    const relay = c.includes(' typ relay ')
+    const host = c.includes(' typ host ')
+    const srflx = c.includes(' typ srflx ')
+    return { kind: 'candidate', relay, host, srflx, preview: c.slice(0, 80) }
+  }
+  return { kind: signal.type || 'signal' }
+}
+
 /**
  * @param {object} props
  * @param {import('socket.io-client').Socket} props.socket
@@ -47,12 +81,19 @@ export default function VideoChatWebRTC({
   const answererIceBufferRef = useRef([])
   const offererIceBufferRef = useRef([])
   const answerAppliedRef = useRef(false)
+  const connPhaseRef = useRef('connecting')
+  const autoRetryCountRef = useRef(0)
+  const offerRequestTimerRef = useRef(null)
 
   const [mediaError, setMediaError] = useState(null)
   const [hasStream, setHasStream] = useState(false)
   const [connPhase, setConnPhase] = useState('connecting')
   const [failureReason, setFailureReason] = useState(null)
   const [retryKey, setRetryKey] = useState(0)
+
+  useEffect(() => {
+    connPhaseRef.current = connPhase
+  }, [connPhase])
 
   const [selectedFilter, setSelectedFilter] = useState(() => String(localVideoFilter || 'none'))
   const [pitchEnabled, setPitchEnabled] = useState(false)
@@ -105,11 +146,15 @@ export default function VideoChatWebRTC({
   const emitSignal = useCallback(
     (data) => {
       if (!socket?.connected || !roomId) return
+      const meta = describeSignal(data)
       if (data.type === 'offer') {
+        console.log('[video-chat] ICE/signal sent: offer', { roomId, ...meta })
         socket.emit('webrtc_offer', { room_id: roomId, sdp: data })
       } else if (data.type === 'answer') {
+        console.log('[video-chat] ICE/signal sent: answer', { roomId, ...meta })
         socket.emit('webrtc_answer', { room_id: roomId, sdp: data })
       } else {
+        console.log('[video-chat] ICE candidate sent', { roomId, ...meta })
         socket.emit('ice_candidate', { room_id: roomId, candidate: data })
       }
     },
@@ -233,11 +278,14 @@ export default function VideoChatWebRTC({
   const inCall = Boolean(roomId && peerUserId)
 
   useEffect(() => {
-    if (!socket || !roomId || !peerUserId || mediaError) return
+    if (!socket || !roomId || !peerUserId || mediaError || !hasStream) return
     const stream = processedStreamRef.current || localStreamRef.current
     if (!stream) return
 
-    console.log('[video-chat] WebRTC starting', { roomId, peerUserId, isOfferer })
+    const peerRole = isOfferer ? 'offerer' : 'answerer'
+    const rtcConfig = buildPeerRtcConfig(iceConfig, peerRole)
+
+    console.log('[video-chat] WebRTC starting', { roomId, peerUserId, isOfferer, retryKey })
 
     answererIceBufferRef.current = []
     offererIceBufferRef.current = []
@@ -248,7 +296,22 @@ export default function VideoChatWebRTC({
       setConnPhase('connecting')
     })
 
-    socket.emit('join_match_room', { room_id: roomId })
+    const clearOfferRequestTimer = () => {
+      if (offerRequestTimerRef.current) {
+        clearTimeout(offerRequestTimerRef.current)
+        offerRequestTimerRef.current = null
+      }
+    }
+
+    if (!isOfferer) {
+      clearOfferRequestTimer()
+      offerRequestTimerRef.current = setTimeout(() => {
+        if (!peerRef.current && socket?.connected && roomId) {
+          console.log('[video-chat] answerer requesting signal replay (no offer yet)')
+          socket.emit('webrtc_request_signals', { room_id: roomId })
+        }
+      }, OFFER_REQUEST_DELAY_MS)
+    }
 
     const flushAnswererIce = () => {
       const p = peerRef.current
@@ -257,9 +320,10 @@ export default function VideoChatWebRTC({
       while (buf.length) {
         const c = buf.shift()
         try {
+          console.log('[video-chat] flushing buffered ICE to answerer peer', describeSignal(c))
           p.signal(c)
-        } catch {
-          // ignore
+        } catch (e) {
+          console.warn('[video-chat] flush answerer ICE failed', e)
         }
       }
     }
@@ -271,67 +335,78 @@ export default function VideoChatWebRTC({
       while (buf.length) {
         const c = buf.shift()
         try {
+          console.log('[video-chat] flushing buffered ICE to offerer peer', describeSignal(c))
           p.signal(c)
-        } catch {
-          // ignore
+        } catch (e) {
+          console.warn('[video-chat] flush offerer ICE failed', e)
         }
+      }
+    }
+
+    const applyRemoteSignal = (sdp, label) => {
+      const peer = peerRef.current
+      if (!peer) {
+        console.warn('[video-chat] no peer to apply signal', { label, type: sdp?.type })
+        return
+      }
+      console.log('[video-chat] applying remote signal', { label, ...describeSignal(sdp) })
+      peer.signal(sdp)
+      if (isOfferer && sdp?.type === 'answer') {
+        answerAppliedRef.current = true
+        flushOffererIce()
+      }
+      if (!isOfferer && sdp?.type === 'offer') {
+        flushAnswererIce()
       }
     }
 
     const attachPeerHandlers = (peer) => {
       peer.on('signal', emitSignal)
       peer.on('stream', (remoteStream) => {
+        console.log('[video-chat] peer stream event', {
+          roomId,
+          tracks: remoteStream?.getTracks?.()?.map((t) => t.kind),
+        })
+        autoRetryCountRef.current = 0
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = remoteStream
         }
         setConnPhase('live')
       })
-      peer.on('connect', () => setConnPhase('live'))
+      peer.on('connect', () => {
+        console.log('[video-chat] peer connect event', { roomId, isOfferer })
+        autoRetryCountRef.current = 0
+        setConnPhase('live')
+      })
       peer.on('error', (err) => {
+        console.error('[video-chat] peer error', err?.message || err)
         setFailureReason(err?.message || 'WebRTC error')
         setConnPhase('failed')
       })
       peer.on('close', () => {
-        setConnPhase('failed')
-        setFailureReason('Connection closed.')
+        console.warn('[video-chat] peer close event', { roomId })
+        if (connPhaseRef.current !== 'live') {
+          setConnPhase('failed')
+          setFailureReason('Connection closed.')
+        }
       })
     }
 
     const onOfferRelay = ({ sdp }) => {
       if (isOfferer) return
-      if (peerRef.current) {
-        try {
-          peerRef.current.signal(sdp)
-        } catch {
-          // ignore
-        }
-        return
-      }
-      const peer = new Peer({
-        initiator: false,
-        trickle: true,
-        stream,
-        config: iceConfig,
-      })
-      peerRef.current = peer
-      attachPeerHandlers(peer)
+      clearOfferRequestTimer()
       try {
-        peer.signal(sdp)
+        applyRemoteSignal(sdp, 'offer_relay')
       } catch (e) {
         setFailureReason(e?.message || 'Failed to apply offer')
         setConnPhase('failed')
       }
-      flushAnswererIce()
     }
 
     const onAnswerRelay = ({ sdp }) => {
       if (!isOfferer) return
-      const peer = peerRef.current
-      if (!peer) return
       try {
-        peer.signal(sdp)
-        answerAppliedRef.current = true
-        flushOffererIce()
+        applyRemoteSignal(sdp, 'answer_relay')
       } catch (e) {
         setFailureReason(e?.message || 'Failed to apply answer')
         setConnPhase('failed')
@@ -339,7 +414,8 @@ export default function VideoChatWebRTC({
     }
 
     const onIceRelay = ({ candidate }) => {
-      if (!candidate) return
+      if (candidate == null) return
+      console.log('[video-chat] ICE candidate received', describeSignal(candidate))
       const peer = peerRef.current
       if (!peer) {
         if (isOfferer) {
@@ -355,12 +431,13 @@ export default function VideoChatWebRTC({
       }
       try {
         peer.signal(candidate)
-      } catch {
-        // ignore
+      } catch (e) {
+        console.warn('[video-chat] apply ICE candidate failed', e)
       }
     }
 
     const onRoomError = (err) => {
+      console.error('[video-chat] room_error', err?.message || err)
       setFailureReason(err?.message || 'Room error')
       setConnPhase('failed')
     }
@@ -379,17 +456,50 @@ export default function VideoChatWebRTC({
     socket.on('webrtc_peer_disconnected', onPeerDisconnectedEvt)
 
     if (isOfferer) {
+      console.log('[video-chat] creating offerer peer', { roomId })
       const peer = new Peer({
         initiator: true,
         trickle: true,
         stream,
-        config: iceConfig,
+        config: rtcConfig,
+      })
+      peerRef.current = peer
+      attachPeerHandlers(peer)
+    } else {
+      console.log('[video-chat] creating answerer peer', { roomId })
+      const peer = new Peer({
+        initiator: false,
+        trickle: true,
+        stream,
+        config: rtcConfig,
       })
       peerRef.current = peer
       attachPeerHandlers(peer)
     }
 
+    // Join room and request any signals exchanged before listeners were ready.
+    socket.emit('join_match_room', { room_id: roomId })
+
+    const connectTimeout = setTimeout(() => {
+      if (connPhaseRef.current !== 'connecting') return
+      if (autoRetryCountRef.current >= MAX_AUTO_RETRIES) {
+        console.error('[video-chat] WebRTC connect timeout — max retries reached', { roomId })
+        setFailureReason('Could not connect to partner. Tap Retry or find a new match.')
+        setConnPhase('failed')
+        return
+      }
+      autoRetryCountRef.current += 1
+      console.warn('[video-chat] WebRTC connect timeout — auto retry', {
+        roomId,
+        attempt: autoRetryCountRef.current,
+      })
+      destroyPeer()
+      setRetryKey((k) => k + 1)
+    }, CONNECT_TIMEOUT_MS)
+
     return () => {
+      clearTimeout(connectTimeout)
+      clearOfferRequestTimer()
       socket.off('webrtc_offer_relay', onOfferRelay)
       socket.off('webrtc_answer_relay', onAnswerRelay)
       socket.off('ice_candidate_relay', onIceRelay)
@@ -397,9 +507,22 @@ export default function VideoChatWebRTC({
       socket.off('webrtc_peer_disconnected', onPeerDisconnectedEvt)
       destroyPeer()
     }
-  }, [socket, roomId, peerUserId, mediaError, isOfferer, emitSignal, destroyPeer, onPeerDisconnected, retryKey, iceConfig])
+  }, [
+    socket,
+    roomId,
+    peerUserId,
+    mediaError,
+    hasStream,
+    isOfferer,
+    emitSignal,
+    destroyPeer,
+    onPeerDisconnected,
+    retryKey,
+    iceConfig,
+  ])
 
   const handleRetry = () => {
+    autoRetryCountRef.current = 0
     destroyPeer()
     setFailureReason(null)
     setConnPhase('connecting')
