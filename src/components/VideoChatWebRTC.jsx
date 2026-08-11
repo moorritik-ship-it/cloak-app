@@ -49,8 +49,8 @@ function describeSignal(signal) {
  * @param {boolean} props.isOfferer
  * @param {() => void} [props.onPeerDisconnected]
  * @param {boolean} [props.micMuted]
- * @param {boolean} [props.cameraOff]
  * @param {string} [props.localVideoFilter]
+ * @param {boolean} [props.isSearching]
  * @param {boolean} [props.remoteFadeOut] — 300ms fade before tearing down peer (Omegle Next)
  * @param {number | null} [props.skipLockoutUntilMs] — wall-clock ms when Next unlocks
  * @param {number} [props.lockoutRemainingSec]
@@ -64,15 +64,15 @@ export default function VideoChatWebRTC({
   isOfferer,
   onPeerDisconnected,
   micMuted = false,
-  cameraOff = false,
   localVideoFilter = 'none',
   remoteFadeOut = false,
   skipLockoutUntilMs = null,
   lockoutRemainingSec = 0,
   countdownDigit = null,
+  isSearching = false,
 }) {
   const localVideoRef = useRef(null)
-  useCloakEngagement(socket, roomId, localVideoRef, cameraOff)
+  useCloakEngagement(socket, roomId, localVideoRef, false)
   const localCanvasRef = useRef(null)
   const remoteVideoRef = useRef(null)
   const peerRef = useRef(null)
@@ -264,9 +264,9 @@ export default function VideoChatWebRTC({
     const s = localStreamRef.current
     if (!s || !hasStream) return
     s.getVideoTracks().forEach((t) => {
-      t.enabled = !cameraOff
+      t.enabled = true
     })
-  }, [cameraOff, hasStream])
+  }, [hasStream])
 
   useEffect(() => {
     const el = localVideoRef.current
@@ -553,7 +553,7 @@ export default function VideoChatWebRTC({
           autoPlay
           aria-label="Remote participant video"
         />
-        {!inCall ? (
+        {!inCall || isSearching ? (
           <div className="video-chat-search-layer">
             <MatchingParticles />
             <p className="video-chat-search-label">
@@ -597,11 +597,11 @@ export default function VideoChatWebRTC({
       <video ref={localVideoRef} className="video-chat-local-source" playsInline autoPlay muted />
       <canvas
         ref={localCanvasRef}
-        className="video-chat-local-pip z-[5] max-md:!bottom-[calc(6.5rem+env(safe-area-inset-bottom,0px))] max-md:!right-3 max-md:!left-auto max-md:!top-auto max-md:!w-[min(34vw,8rem)] max-md:!max-h-[9.5rem] max-md:!rounded-xl"
+        className="video-chat-local-pip"
         aria-label="Your camera"
       />
 
-      <div className="vc-filter-strip" role="region" aria-label="Filters">
+      <div className="vc-filter-strip vc-filter-strip--hidden" aria-hidden="true">
         <div className="vc-filter-strip-head">
           <span className="vc-filter-strip-title">{selectedLabel}</span>
           <label className="vc-filter-voice">

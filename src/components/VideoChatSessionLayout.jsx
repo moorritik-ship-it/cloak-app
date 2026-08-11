@@ -3,8 +3,6 @@ import { useNavigate } from 'react-router-dom'
 import {
   Mic,
   MicOff,
-  Video,
-  VideoOff,
   Sparkles,
   ChevronUp,
   ChevronDown,
@@ -45,11 +43,13 @@ function formatMessageTime(iso) {
  * @param {string} props.displayName
  * @param {import('react').ReactNode} props.children — video column (VideoChatWebRTC)
  * @param {boolean} props.micMuted
- * @param {boolean} props.cameraOff
  * @param {string} props.filterMode
- * @param {(next: { micMuted: boolean; cameraOff: boolean; filterMode: string }) => void} props.onControlsChange
+ * @param {(next: { micMuted?: boolean; filterMode?: string }) => void} props.onControlsChange
  * @param {import('socket.io-client').Socket | null} [props.socket]
  * @param {() => void} [props.onNext] — Omegle-style skip (no confirm)
+ * @param {() => void} [props.onEndChat] — leave session and notify partner
+ * @param {boolean} [props.chatEnabled] — text chat active during live call
+ * @param {boolean} [props.isSearching] — waiting for next match
  * @param {boolean} [props.nextDisabled]
  * @param {number} [props.lockoutRemainingSec]
  * @param {string | null} [props.sessionNotice]
@@ -59,6 +59,7 @@ function formatMessageTime(iso) {
  */
 export default function VideoChatSessionLayout({
   roomId = null,
+  chatEnabled = false,
   sessionEndAtMs: sessionEndAtMsProp = null,
   currentUserId = null,
   partnerUserId = null,
@@ -66,16 +67,17 @@ export default function VideoChatSessionLayout({
   displayName,
   children,
   micMuted,
-  cameraOff,
   filterMode,
   onControlsChange,
   socket = null,
   onNext,
+  onEndChat,
   nextDisabled = false,
   lockoutRemainingSec = 0,
   sessionNotice = null,
   sessionId = null,
   onFindNewMatch,
+  isSearching = false,
 }) {
   const navigate = useNavigate()
   const chatId = useId()
@@ -135,7 +137,7 @@ export default function VideoChatSessionLayout({
     postSessionExpiresAt != null ||
     postSessionClosed ||
     ratingOrWaitPhase ||
-    (roomId && remainingMs <= 0)
+    (roomId && typeof effectiveSessionEndMs === 'number' && remainingMs <= 0)
 
   useEffect(() => {
     if (!roomId || !socket) return
@@ -358,7 +360,7 @@ export default function VideoChatSessionLayout({
     (m) => m.phase === 'post_session' && m.sender_user_id === currentUserId,
   ).length
   const postSessionFull = postSessionExpiresAt != null && postSessionMsgCount >= 2
-  const inputLocked = !roomId || !socket || postSessionClosed || postSessionFull
+  const inputLocked = !chatEnabled || !roomId || !socket || postSessionClosed || postSessionFull
 
   const sendMessage = useCallback(() => {
     if (!socket || !roomId || inputLocked) return
@@ -505,27 +507,12 @@ export default function VideoChatSessionLayout({
   }, [nextDisabled, onNext, livePhaseEnded])
 
   const handleEnd = useCallback(() => {
-    if (postSessionClosed) {
+    if (postSessionClosed || postSessionExpiresAt != null || ratingUi != null) {
       navigate('/dashboard')
       return
     }
-    if (postSessionExpiresAt != null) {
-      navigate('/dashboard')
-      return
-    }
-    if (ratingUi != null) {
-      navigate('/dashboard')
-      return
-    }
-    if (!socket || !roomId) {
-      navigate('/dashboard')
-      return
-    }
-    if (!naturalEndEmittedRef.current) {
-      naturalEndEmittedRef.current = true
-      socket.emit('session_end_natural', { room_id: roomId })
-    }
-  }, [socket, roomId, navigate, postSessionExpiresAt, postSessionClosed, ratingUi])
+    onEndChat?.()
+  }, [navigate, postSessionExpiresAt, postSessionClosed, ratingUi, onEndChat])
 
   const handleReport = useCallback(() => {
     if (!sessionId || !partnerUserId) {
@@ -594,16 +581,12 @@ export default function VideoChatSessionLayout({
     const order = ['none', 'warm', 'cool']
     const i = order.indexOf(filterMode)
     const next = order[(i + 1) % order.length]
-    onControlsChange({ micMuted, cameraOff, filterMode: next })
-  }, [filterMode, micMuted, cameraOff, onControlsChange])
+    onControlsChange({ micMuted, filterMode: next })
+  }, [filterMode, micMuted, onControlsChange])
 
   const toggleMic = useCallback(() => {
-    onControlsChange({ micMuted: !micMuted, cameraOff, filterMode })
-  }, [micMuted, cameraOff, filterMode, onControlsChange])
-
-  const toggleCam = useCallback(() => {
-    onControlsChange({ micMuted, cameraOff: !cameraOff, filterMode })
-  }, [micMuted, cameraOff, filterMode, onControlsChange])
+    onControlsChange({ micMuted: !micMuted, filterMode })
+  }, [micMuted, filterMode, onControlsChange])
 
   const onDrawerTouchStart = (e) => {
     touchStartY.current = e.touches[0].clientY
@@ -776,25 +759,22 @@ export default function VideoChatSessionLayout({
           {walletRefundNotice}
         </div>
       ) : null}
-      <header className="vc-header z-30 flex min-h-[3rem] shrink-0 flex-wrap items-center justify-between gap-2 border-b border-[var(--border-color)] bg-[color-mix(in_srgb,var(--background-secondary)_92%,transparent)] px-3 py-2 text-sm sm:px-4 sm:text-base">
-        <div className="vc-header-left">
-          <span className="vc-partner-name" title={partnerUsername}>
-            {partnerUsername || 'Partner'}
-          </span>
-          <div className="vc-session-timer-wrap" aria-live="polite" title="Time remaining in live session">
-            <span className="vc-session-timer-label">Session ends in</span>
-            <span className="vc-session-timer-big">{formatCountdown(remainingMs)}</span>
-            {effectiveSessionEndMs != null ? (
-              <span className="vc-session-timer-absolute">
-                {new Date(effectiveSessionEndMs).toLocaleTimeString(undefined, {
-                  hour: 'numeric',
-                  minute: '2-digit',
-                })}
-              </span>
-            ) : null}
+      <header className="vc-header z-30 flex min-h-[3.25rem] shrink-0 flex-wrap items-center justify-between gap-3 border-b border-[var(--border-color)] bg-[color-mix(in_srgb,var(--background-secondary)_94%,transparent)] px-4 py-2.5">
+        <div className="vc-header-left flex min-w-0 flex-1 items-center gap-4">
+          <div className="vc-header-partner min-w-0">
+            <span className="vc-partner-label">Partner</span>
+            <span className="vc-partner-name" title={partnerUsername}>
+              {isSearching ? 'Searching…' : partnerUsername || 'Partner'}
+            </span>
           </div>
+          {!isSearching && roomId ? (
+            <div className="vc-session-timer-wrap" aria-live="polite" title="Time remaining in live session">
+              <span className="vc-session-timer-label">Session</span>
+              <span className="vc-session-timer-big">{formatCountdown(remainingMs)}</span>
+            </div>
+          ) : null}
         </div>
-        <div className="vc-header-actions max-md:max-w-[min(52vw,13rem)] max-md:overflow-x-auto max-md:pb-0.5 max-md:[scrollbar-width:none] max-md:[&::-webkit-scrollbar]:hidden">
+        <div className="vc-header-actions flex shrink-0 flex-wrap items-center justify-end gap-2">
           {nextDisabled && lockoutRemainingSec > 0 ? (
             <span className="vc-next-lockout-hint" title="Skip limit">
               Next locked: {Math.floor(lockoutRemainingSec / 60)}:
@@ -803,89 +783,66 @@ export default function VideoChatSessionLayout({
           ) : null}
           <button
             type="button"
-            className="vc-btn-next vc-btn-next--header max-md:hidden"
-            onClick={handleNext}
-            aria-label="Next partner"
-            disabled={nextDisabled || nextLockedByPhase}
+            className={`vc-tool-btn vc-tool-btn--header ${micMuted ? 'vc-tool-btn--off' : ''}`}
+            onClick={toggleMic}
+            aria-pressed={micMuted}
+            aria-label={micMuted ? 'Unmute microphone' : 'Mute microphone'}
           >
-            <SkipForward size={22} strokeWidth={2.5} aria-hidden />
-            <span>Next</span>
+            {micMuted ? <MicOff size={20} /> : <Mic size={20} />}
           </button>
           <button
             type="button"
-            className="vc-btn-end min-h-12 shrink-0 px-2 text-xs sm:text-sm"
-            onClick={handleEnd}
+            className="vc-tool-btn vc-tool-btn--header"
+            onClick={cycleFilter}
+            aria-label="Video filter"
+            title={`Filter: ${filterMode}`}
           >
+            <Sparkles size={20} />
+          </button>
+          <button
+            type="button"
+            className="vc-btn-next vc-btn-next--header"
+            onClick={handleNext}
+            aria-label="Next partner"
+            disabled={nextDisabled || nextLockedByPhase || isSearching}
+          >
+            <SkipForward size={20} strokeWidth={2.5} aria-hidden />
+            <span>Next</span>
+          </button>
+          <button type="button" className="vc-btn-end" onClick={handleEnd}>
             <PhoneOff size={18} aria-hidden />
             <span>{postSessionExpiresAt != null || postSessionClosed ? 'Leave' : 'End Chat'}</span>
           </button>
-          <button
-            type="button"
-            className="vc-btn-report min-h-12 shrink-0 px-2 text-xs sm:text-sm"
-            onClick={handleReport}
-          >
+          <button type="button" className="vc-btn-report" onClick={handleReport}>
             <Flag size={18} aria-hidden />
-            <span>Report</span>
+            <span className="max-md:sr-only">Report</span>
           </button>
-          <button
-            type="button"
-            className="vc-btn-block min-h-12 shrink-0 px-2 text-xs sm:text-sm"
-            onClick={handleBlock}
-            disabled={blockBusy}
-          >
-            <span>Block</span>
+          <button type="button" className="vc-btn-block" onClick={handleBlock} disabled={blockBusy}>
+            Block
           </button>
         </div>
       </header>
 
       <div className="vc-body flex min-h-0 min-w-0 flex-1 flex-col md:flex-row">
         <div
-          className="vc-video-col flex min-h-0 min-w-0 flex-col max-md:flex-1"
+          className="vc-video-col relative flex min-h-0 min-w-0 flex-col max-md:flex-1"
           onTouchStart={onVideoAreaTouchStart}
           onTouchEnd={onVideoAreaTouchEnd}
         >
           {children}
         </div>
         <aside className="vc-chat-desktop" aria-labelledby={chatId}>
-          <h2 id={chatId} className="vc-chat-heading">
-            Chat
-          </h2>
-          <p className="vc-chat-you">
-            You: <strong>{displayName}</strong>
-          </p>
+          <div className="vc-chat-desktop-head">
+            <h2 id={chatId} className="vc-chat-heading">
+              Chat
+            </h2>
+            <p className="vc-chat-you">
+              You: <strong>{displayName}</strong>
+            </p>
+          </div>
           <ChatPanel className="vc-chat-panel vc-chat-panel--desktop" />
         </aside>
       </div>
-
-      <footer className="vc-bottom-bar flex shrink-0 items-center justify-center gap-3 px-3 py-2 sm:gap-4 sm:px-4">
-        <button
-          type="button"
-          className={`vc-tool-btn min-h-12 min-w-12 shrink-0 ${micMuted ? 'vc-tool-btn--off' : ''}`}
-          onClick={toggleMic}
-          aria-pressed={micMuted}
-          aria-label={micMuted ? 'Unmute microphone' : 'Mute microphone'}
-        >
-          {micMuted ? <MicOff size={22} /> : <Mic size={22} />}
-        </button>
-        <button
-          type="button"
-          className={`vc-tool-btn min-h-12 min-w-12 shrink-0 ${cameraOff ? 'vc-tool-btn--off' : ''}`}
-          onClick={toggleCam}
-          aria-pressed={cameraOff}
-          aria-label={cameraOff ? 'Turn camera on' : 'Turn camera off'}
-        >
-          {cameraOff ? <VideoOff size={22} /> : <Video size={22} />}
-        </button>
-        <button
-          type="button"
-          className="vc-tool-btn min-h-12 min-w-12 shrink-0"
-          onClick={cycleFilter}
-          aria-label="Video filter"
-          title={`Filter: ${filterMode}`}
-        >
-          <Sparkles size={22} />
-        </button>
-      </footer>
 
       <ReportUserModal
         open={reportOpen}
@@ -896,10 +853,10 @@ export default function VideoChatSessionLayout({
 
       <button
         type="button"
-        className="vc-btn-next vc-btn-next--mobile-float fixed bottom-[calc(5rem+env(safe-area-inset-bottom,0px))] left-1/2 z-[96] hidden min-h-14 w-[min(20rem,calc(100%-1.5rem))] max-w-[calc(100vw-1.5rem)] -translate-x-1/2 items-center justify-center gap-2 rounded-xl px-8 py-3 text-base font-black shadow-lg max-md:inline-flex md:hidden"
+        className="vc-btn-next vc-btn-next--mobile-float fixed bottom-[calc(1.25rem+env(safe-area-inset-bottom,0px))] left-1/2 z-[96] hidden min-h-12 w-[min(18rem,calc(100%-1.5rem))] max-w-[calc(100vw-1.5rem)] -translate-x-1/2 items-center justify-center gap-2 rounded-xl px-6 py-2.5 text-base font-black shadow-lg max-md:inline-flex md:hidden"
         onClick={handleNext}
         aria-label="Next partner"
-        disabled={nextDisabled || nextLockedByPhase}
+        disabled={nextDisabled || nextLockedByPhase || isSearching}
       >
         <SkipForward size={26} strokeWidth={2.5} aria-hidden />
         <span>Next</span>

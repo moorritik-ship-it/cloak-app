@@ -40,10 +40,10 @@ function VideoChatPage() {
   const [errorMessage, setErrorMessage] = useState(null)
 
   const [micMuted, setMicMuted] = useState(false)
-  const [cameraOff, setCameraOff] = useState(false)
   const [filterMode, setFilterMode] = useState('none')
 
   const [remoteFadeOut, setRemoteFadeOut] = useState(false)
+  const [webrtcKey, setWebrtcKey] = useState(0)
   const [sessionNotice, setSessionNotice] = useState(null)
   const [skipLockoutUntil, setSkipLockoutUntil] = useState(null)
   const [lockoutClock, setLockoutClock] = useState(0)
@@ -55,7 +55,6 @@ function VideoChatPage() {
 
   const handleControlsChange = useCallback((next) => {
     if (next.micMuted !== undefined) setMicMuted(next.micMuted)
-    if (next.cameraOff !== undefined) setCameraOff(next.cameraOff)
     if (next.filterMode !== undefined) setFilterMode(next.filterMode)
   }, [])
 
@@ -74,6 +73,7 @@ function VideoChatPage() {
 
   useEffect(() => {
     transitionToWaitingRef.current = (notice) => {
+      setWebrtcKey((k) => k + 1)
       setRemoteFadeOut(true)
       window.setTimeout(() => {
         setMatchPayload(null)
@@ -279,12 +279,13 @@ function VideoChatPage() {
     socket.on('connect_error', onConnectError)
 
     const onSkipAccepted = () => {
-      transitionToWaitingRef.current?.('Finding a new match…')
+      transitionToWaitingRef.current?.('Looking for someone…')
     }
-    const onPeerMovedOn = ({ message }) => {
-      transitionToWaitingRef.current?.(
-        message || 'Your match has moved on — finding you a new connection...',
-      )
+    const onPeerMovedOn = () => {
+      transitionToWaitingRef.current?.('Looking for someone…')
+    }
+    const onSkipError = ({ message }) => {
+      setSessionNotice(message || 'Could not skip to next match.')
     }
     const onSkipRateLimited = ({ locked_until_ms }) => {
       if (typeof locked_until_ms === 'number') {
@@ -315,13 +316,27 @@ function VideoChatPage() {
       setPhase('ban_blocked')
     }
 
+    const onPartnerLeftChat = ({ message }) => {
+      setWebrtcKey((k) => k + 1)
+      setMatchPayload(null)
+      setStagedMatch(null)
+      setCountdownDigit(null)
+      setSessionNotice(message || 'Your partner has left the chat')
+      setPhase('partner_left')
+      window.setTimeout(() => {
+        navigate('/dashboard')
+      }, 2500)
+    }
+
     socket.on('skip_accepted', onSkipAccepted)
     socket.on('peer_moved_on', onPeerMovedOn)
+    socket.on('skip_error', onSkipError)
     socket.on('skip_rate_limited', onSkipRateLimited)
     socket.on('session_payer_rematch', onSessionPayerRematch)
     socket.on('free_video_ban', onFreeVideoBan)
     socket.on('session_payment_outcome', onSessionPaymentOutcome)
     socket.on('account_banned', onAccountBanned)
+    socket.on('partner_left_chat', onPartnerLeftChat)
 
     return () => {
       socket.off('connect', onConnect)
@@ -332,18 +347,20 @@ function VideoChatPage() {
       socket.off('connect_error', onConnectError)
       socket.off('skip_accepted', onSkipAccepted)
       socket.off('peer_moved_on', onPeerMovedOn)
+      socket.off('skip_error', onSkipError)
       socket.off('skip_rate_limited', onSkipRateLimited)
       socket.off('session_payer_rematch', onSessionPayerRematch)
       socket.off('free_video_ban', onFreeVideoBan)
       socket.off('session_payment_outcome', onSessionPaymentOutcome)
       socket.off('account_banned', onAccountBanned)
+      socket.off('partner_left_chat', onPartnerLeftChat)
       if (socket.connected) {
         socket.emit('leave_queue')
       }
       socket.disconnect()
       setClientSocket(null)
     }
-  }, [displayName, token])
+  }, [displayName, token, navigate])
 
   useEffect(() => {
     if (phase !== 'countdown' || countdownDigit === null) return
@@ -377,10 +394,23 @@ function VideoChatPage() {
   }, [phase])
 
   const requestSkip = useCallback(() => {
-    if (!clientSocket || !matchPayload?.room_id) return
+    const roomId = (matchPayload ?? stagedMatch)?.room_id
+    if (!clientSocket || !roomId) return
     if (skipLockoutUntil != null && Date.now() < skipLockoutUntil) return
-    clientSocket.emit('skip_match', { room_id: matchPayload.room_id })
-  }, [clientSocket, matchPayload, skipLockoutUntil])
+    setWebrtcKey((k) => k + 1)
+    clientSocket.emit('skip_match', { room_id: roomId })
+  }, [clientSocket, matchPayload, stagedMatch, skipLockoutUntil])
+
+  const handleEndChat = useCallback(() => {
+    const roomId = (matchPayload ?? stagedMatch)?.room_id
+    setWebrtcKey((k) => k + 1)
+    if (clientSocket && roomId) {
+      clientSocket.emit('end_chat', { room_id: roomId })
+    }
+    setMatchPayload(null)
+    setStagedMatch(null)
+    navigate('/dashboard')
+  }, [clientSocket, matchPayload, stagedMatch, navigate])
 
   const lockoutRemainingSec = useMemo(() => {
     void lockoutClock
@@ -477,6 +507,20 @@ function VideoChatPage() {
     )
   }
 
+  if (phase === 'partner_left') {
+    return (
+      <main className="simple-page video-chat-page">
+        <section className="simple-card video-chat-card">
+          <h1>Chat ended</h1>
+          <p className="video-chat-status" role="status">
+            {sessionNotice || 'Your partner has left the chat'}
+          </p>
+          <p className="video-chat-hint">Returning to dashboard…</p>
+        </section>
+      </main>
+    )
+  }
+
   const inCallShell =
     clientSocket && (phase === 'waiting' || phase === 'matched' || phase === 'countdown')
 
@@ -489,10 +533,13 @@ function VideoChatPage() {
         : activeMatch?.peer_username ?? 'Searching…'
     const nextLocked = skipLockoutUntil != null && Date.now() < skipLockoutUntil
 
+    const chatActive = Boolean(activeMatch?.room_id && (phase === 'matched' || phase === 'countdown'))
+
     return (
       <div className="video-chat-page video-chat-page--call-mode max-w-[100vw] overflow-x-hidden">
         <VideoChatSessionLayout
           roomId={activeMatch?.room_id ?? null}
+          chatEnabled={chatActive}
           sessionEndAtMs={activeMatch?.session_end_at_ms ?? null}
           sessionId={activeMatch?.session_id ?? null}
           partnerUserId={activeMatch?.peer_user_id ?? null}
@@ -501,31 +548,33 @@ function VideoChatPage() {
           displayName={displayName}
           socket={clientSocket}
           micMuted={micMuted}
-          cameraOff={cameraOff}
           filterMode={filterMode}
           onControlsChange={handleControlsChange}
           onNext={requestSkip}
+          onEndChat={handleEndChat}
           nextDisabled={nextLocked}
           lockoutRemainingSec={nextLocked ? lockoutRemainingSec : 0}
           sessionNotice={sessionNotice}
+          isSearching={phase === 'waiting'}
           onFindNewMatch={() => {
             clientSocket.emit('join_queue', { username: displayName })
-            transitionToWaitingRef.current?.('Finding a new match…')
+            transitionToWaitingRef.current?.('Looking for someone…')
           }}
         >
           <VideoChatWebRTC
+            key={webrtcKey}
             socket={clientSocket}
             iceConfig={ICE_SERVERS}
             roomId={activeMatch?.room_id ?? null}
             peerUserId={activeMatch?.peer_user_id ?? null}
             isOfferer={activeMatch ? computeIsOfferer(activeMatch) : false}
             micMuted={micMuted}
-            cameraOff={cameraOff}
             localVideoFilter={filterMode}
             remoteFadeOut={remoteFadeOut}
             skipLockoutUntilMs={skipLockoutUntil}
             lockoutRemainingSec={lockoutRemainingSec}
             countdownDigit={phase === 'countdown' ? countdownDigit : null}
+            isSearching={phase === 'waiting'}
           />
         </VideoChatSessionLayout>
       </div>

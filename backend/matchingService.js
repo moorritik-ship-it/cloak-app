@@ -1254,7 +1254,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
           otherSocket.data.matchRoomId = undefined
         }
 
-        const otherMsg = 'Your match has moved on — finding you a new connection...'
+        const otherMsg = 'Looking for someone…'
 
         if (otherSocket) {
           otherSocket.emit('peer_moved_on', { message: otherMsg })
@@ -1272,6 +1272,62 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       } catch (e) {
         console.error('[matching] skip_match error:', e)
         socket.emit('skip_error', { message: 'Could not skip to next match.' })
+      }
+    })
+
+    socket.on('end_chat', async (payload) => {
+      try {
+        const roomId = payload?.room_id
+        if (!roomId || typeof roomId !== 'string') {
+          return socket.emit('end_chat_error', { message: 'room_id required.' })
+        }
+        const room = activeMatchRooms.get(roomId)
+        if (!room || !room.sockets.includes(socket.id)) {
+          return socket.emit('end_chat_error', { message: 'Invalid or expired room.' })
+        }
+
+        const userId = socket.data.userId
+        const otherId = room.sockets.find((id) => id !== socket.id)
+        const dbSessionIdEnd = room.dbSessionId
+        const sessionStartMsEnd = room.sessionStartMs
+        const { u1: engU1e, u2: engU2e } = getEngagementSnapshot(room)
+
+        if (dbSessionIdEnd && prisma) {
+          try {
+            await prisma.session.update({
+              where: { id: dbSessionIdEnd },
+              data: {
+                user1EngagedSeconds: engU1e,
+                user2EngagedSeconds: engU2e,
+                endedAt: new Date(),
+                durationSeconds: Math.max(0, Math.floor((Date.now() - sessionStartMsEnd) / 1000)),
+                endReason: 'user_end_chat',
+              },
+            })
+            cloakQueue?.enqueueSessionRewards(dbSessionIdEnd)
+          } catch (e) {
+            console.error('[matching] end_chat session update:', e)
+          }
+        }
+
+        clearPostSessionTimer(roomId)
+        clearRoomTimers(room)
+        activeMatchRooms.delete(roomId)
+        socket.data.matchRoomId = undefined
+
+        const otherSocket = otherId ? io.sockets.sockets.get(otherId) : null
+        if (otherSocket) {
+          otherSocket.data.matchRoomId = undefined
+          otherSocket.emit('partner_left_chat', {
+            room_id: roomId,
+            message: 'Your partner has left the chat',
+          })
+        }
+
+        socket.emit('end_chat_ack', { ok: true })
+      } catch (e) {
+        console.error('[matching] end_chat error:', e)
+        socket.emit('end_chat_error', { message: 'Could not end chat.' })
       }
     })
 
@@ -1366,6 +1422,10 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         if (!room || !room.sockets.includes(socket.id)) {
           return socket.emit('chat_error', { message: 'Invalid room.' })
         }
+        if (!prisma) {
+          socket.emit('chat_history', { room_id: roomId, messages: [] })
+          return
+        }
         const rows = await prisma.videoChatMessage.findMany({
           where: { matchRoomId: roomId },
           orderBy: { sentAt: 'asc' },
@@ -1384,6 +1444,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         })
       } catch (e) {
         console.error('[matching] chat_history_request error:', e)
+        socket.emit('chat_history', { room_id: roomId, messages: [] })
       }
     })
 
@@ -1431,24 +1492,40 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         }
 
         const senderUsername = await resolveQueueUsername(socket)
-        const row = await prisma.videoChatMessage.create({
-          data: {
-            matchRoomId: roomId,
-            senderId: userId,
-            senderUsername,
-            content: text,
+        let out
+        try {
+          if (!prisma) {
+            throw new Error('prisma unavailable')
+          }
+          const row = await prisma.videoChatMessage.create({
+            data: {
+              matchRoomId: roomId,
+              senderId: userId,
+              senderUsername,
+              content: text,
+              phase,
+            },
+          })
+          out = {
+            id: row.id,
+            room_id: roomId,
+            text: row.content,
+            sender_username: row.senderUsername,
+            sender_user_id: userId,
+            sent_at: row.sentAt.toISOString(),
+            phase: row.phase,
+          }
+        } catch (dbErr) {
+          console.error('[matching] chat_message db fallback:', dbErr?.message || dbErr)
+          out = {
+            id: `live_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            room_id: roomId,
+            text,
+            sender_username: senderUsername,
+            sender_user_id: userId,
+            sent_at: new Date().toISOString(),
             phase,
-          },
-        })
-
-        const out = {
-          id: row.id,
-          room_id: roomId,
-          text: row.content,
-          sender_username: row.senderUsername,
-          sender_user_id: userId,
-          sent_at: row.sentAt.toISOString(),
-          phase: row.phase,
+          }
         }
         broadcastToMatchRoom(roomId, 'chat_message_relay', out)
       } catch (e) {
