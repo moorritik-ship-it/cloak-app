@@ -298,6 +298,25 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
   }
 
   /**
+   * After reconnect the socket id changes; refresh room membership by user id.
+   * @param {import('socket.io').Socket} socket
+   * @param {{ sockets: string[], userIds: string[] }} room
+   * @returns {boolean}
+   */
+  function ensureSocketInMatchRoom(socket, room) {
+    if (!room?.sockets || !socket?.id) return false
+    if (room.sockets.includes(socket.id)) return true
+    const uid = socket.data?.userId
+    if (!uid || !Array.isArray(room.userIds)) return false
+    const idx = room.userIds.indexOf(uid)
+    if (idx < 0) return false
+    const prev = room.sockets[idx]
+    room.sockets[idx] = socket.id
+    console.log('[matching] refreshed socket in room', { userId: uid, prev, next: socket.id })
+    return true
+  }
+
+  /**
    * @param {import('socket.io').Socket} fromSocket
    * @param {string} roomId
    * @param {string} eventName
@@ -305,7 +324,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
    */
   function relayToPeer(fromSocket, roomId, eventName, payload) {
     const room = activeMatchRooms.get(roomId)
-    if (!room || !room.sockets.includes(fromSocket.id)) {
+    if (!room || !ensureSocketInMatchRoom(fromSocket, room)) {
       console.warn('[webrtc] relay skipped — not in room', {
         eventName,
         roomId,
@@ -919,6 +938,10 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
             matchRoom.dbSessionId = row?.id || null
             payloadA.session_id = row?.id
             payloadB.session_id = row?.id
+            if (matchRoom.userPayloads) {
+              if (matchRoom.userPayloads[A.userId]) matchRoom.userPayloads[A.userId].session_id = row?.id
+              if (matchRoom.userPayloads[B.userId]) matchRoom.userPayloads[B.userId].session_id = row?.id
+            }
           })
           .catch((e) => console.error('[matching] session create:', e?.message || e))
       }
@@ -930,6 +953,11 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       payloadA.session_end_at_ms = sessionStartMs + SESSION_LIVE_MS
       payloadB.session_start_at_ms = sessionStartMs
       payloadB.session_end_at_ms = sessionStartMs + SESSION_LIVE_MS
+
+      matchRoom.userPayloads = {
+        [A.userId]: { ...payloadA },
+        [B.userId]: { ...payloadB },
+      }
 
       console.log('[matching] emitting match_found', {
         roomId,
@@ -1130,7 +1158,9 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
 
       console.log('[matching] attempt_match_immediately', { collegeId: key, queueLen: qlen })
       await tryMatchCollege(key)
-      socket.emit('joined_queue', { ok: true })
+      if (socket.data.inQueue) {
+        socket.emit('joined_queue', { ok: true })
+      }
       return true
     } catch (e) {
       console.error('[matching] enqueue error:', e)
@@ -1282,7 +1312,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
           return socket.emit('end_chat_error', { message: 'room_id required.' })
         }
         const room = activeMatchRooms.get(roomId)
-        if (!room || !room.sockets.includes(socket.id)) {
+        if (!room || !ensureSocketInMatchRoom(socket, room)) {
           return socket.emit('end_chat_error', { message: 'Invalid or expired room.' })
         }
 
@@ -1318,10 +1348,12 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         const otherSocket = otherId ? io.sockets.sockets.get(otherId) : null
         if (otherSocket) {
           otherSocket.data.matchRoomId = undefined
-          otherSocket.emit('partner_left_chat', {
+          const leftPayload = {
             room_id: roomId,
             message: 'Your partner has left the chat',
-          })
+          }
+          otherSocket.emit('partner_left', leftPayload)
+          otherSocket.emit('partner_left_chat', leftPayload)
         }
 
         socket.emit('end_chat_ack', { ok: true })
@@ -1342,18 +1374,23 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         return socket.emit('room_error', { message: 'room_id required.' })
       }
       const room = activeMatchRooms.get(roomId)
-      if (!room || !room.sockets.includes(socket.id)) {
+      if (!room || !ensureSocketInMatchRoom(socket, room)) {
         return socket.emit('room_error', { message: 'Invalid or expired room.' })
       }
       socket.data.matchRoomId = roomId
       console.log('[webrtc] join_match_room', { socketId: socket.id, roomId })
+      const uid = socket.data.userId
+      if (uid && room.userPayloads?.[uid]) {
+        socket.emit('match_found', room.userPayloads[uid])
+        console.log('[webrtc] match_found resync', { socketId: socket.id, roomId, userId: uid })
+      }
       replayWebRtcBufferToSocket(room, roomId, socket.id)
     })
 
     socket.on('webrtc_request_signals', ({ room_id: roomId }) => {
       if (!roomId || typeof roomId !== 'string') return
       const room = activeMatchRooms.get(roomId)
-      if (!room || !room.sockets.includes(socket.id)) return
+      if (!room || !ensureSocketInMatchRoom(socket, room)) return
       console.log('[webrtc] request_signals', { socketId: socket.id, roomId })
       replayWebRtcBufferToSocket(room, roomId, socket.id)
     })
@@ -1419,7 +1456,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       try {
         if (!roomId || typeof roomId !== 'string') return
         const room = activeMatchRooms.get(roomId)
-        if (!room || !room.sockets.includes(socket.id)) {
+        if (!room || !ensureSocketInMatchRoom(socket, room)) {
           return socket.emit('chat_error', { message: 'Invalid room.' })
         }
         if (!prisma) {
@@ -1448,7 +1485,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
       }
     })
 
-    socket.on('chat_message', async (payload) => {
+    const handleChatMessage = async (payload) => {
       try {
         const roomId = payload?.room_id
         const text = typeof payload?.text === 'string' ? payload.text : ''
@@ -1457,7 +1494,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
           return socket.emit('chat_error', { message: 'room_id required.' })
         }
         const room = activeMatchRooms.get(roomId)
-        if (!room || !room.sockets.includes(socket.id)) {
+        if (!room || !ensureSocketInMatchRoom(socket, room)) {
           return socket.emit('chat_error', { message: 'Invalid room.' })
         }
         if (phase === 'post_session') {
@@ -1467,7 +1504,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
         }
 
         if (phase === 'live' && room.liveSessionEnded) {
-          return socket.emit('chat_error', { message: 'Live chat closed — rate the session or use post-session chat when it opens.' })
+          return socket.emit('chat_error', { message: 'Live chat closed.' })
         }
 
         const n = countGraphemes(text)
@@ -1482,7 +1519,7 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
           return socket.emit('chat_error', { message: 'Missing session.' })
         }
 
-        if (phase === 'post_session') {
+        if (phase === 'post_session' && prisma) {
           const cnt = await prisma.videoChatMessage.count({
             where: { matchRoomId: roomId, senderId: userId, phase: 'post_session' },
           })
@@ -1528,11 +1565,15 @@ function createMatchingService({ io, prisma, redis, accessTokenSecret, cloakQueu
           }
         }
         broadcastToMatchRoom(roomId, 'chat_message_relay', out)
+        broadcastToMatchRoom(roomId, 'receive_message', out)
       } catch (e) {
         console.error('[matching] chat_message error:', e)
         socket.emit('chat_error', { message: 'Could not send message.' })
       }
-    })
+    }
+
+    socket.on('chat_message', handleChatMessage)
+    socket.on('send_message', handleChatMessage)
 
     socket.on('chat_typing', (payload) => {
       const roomId = payload?.room_id

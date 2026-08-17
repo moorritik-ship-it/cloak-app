@@ -981,6 +981,44 @@ main {
   pointer-events: none;
 }
 
+.vc-session--rewritten .vc-body {
+  min-height: 0;
+}
+
+.vc-session--rewritten .vc-video-col {
+  min-height: 280px;
+}
+
+@media (min-width: 768px) {
+  .vc-session--rewritten .vc-body {
+    flex-direction: row;
+  }
+
+  .vc-session--rewritten .vc-video-col {
+    width: 70%;
+    flex: 0 0 70%;
+  }
+
+  .vc-session--rewritten .vc-chat-desktop {
+    width: 30%;
+    flex: 0 0 30%;
+  }
+}
+
+.vc-header-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  overflow-x: auto;
+}
+
+.vc-filter-chip--header {
+  min-height: 2rem;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
 .vc-filter-strip {
   position: absolute;
   left: 0.9rem;
