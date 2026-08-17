@@ -1,128 +1,105 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import Peer from 'simple-peer'
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from 'react'
 import MatchingParticles from './MatchingParticles.jsx'
-import MatchCountdownOverlay from './MatchCountdownOverlay.jsx'
-import { useCloakEngagement } from '../hooks/useCloakEngagement.js'
-import { FILTERS, useCanvasVideoFilters } from '../hooks/useCanvasVideoFilters.js'
+import { useCanvasVideoFilters } from '../hooks/useCanvasVideoFilters.js'
 import { ICE_SERVERS } from '../utils/iceServers.js'
 
-const CONNECT_TIMEOUT_MS = 25_000
-const MAX_AUTO_RETRIES = 4
-const OFFER_REQUEST_DELAY_MS = 2_500
+const CONNECT_TIMEOUT_MS = 30_000
 
-/** @param {object} iceConfig */
-function buildPeerRtcConfig(iceConfig, role) {
-  const servers = iceConfig?.iceServers?.length ?? 0
-  const turnServers = (iceConfig?.iceServers || []).filter((s) => {
-    const urls = Array.isArray(s.urls) ? s.urls.join(' ') : String(s.urls || '')
-    return urls.includes('turn:') || urls.includes('turns:')
-  }).length
-  console.log('[video-chat] simple-peer config', { role, iceServers: servers, turnServers, sdpSemantics: iceConfig?.sdpSemantics })
-  return {
-    sdpSemantics: 'unified-plan',
-    ...iceConfig,
-  }
-}
-
-/** @param {object} signal */
-function describeSignal(signal) {
-  if (!signal || typeof signal !== 'object') return { kind: 'unknown' }
-  if (signal.type === 'offer' || signal.type === 'answer') {
-    return { kind: signal.type }
-  }
-  if (signal.candidate) {
-    const c = String(signal.candidate.candidate || signal.candidate)
-    const relay = c.includes(' typ relay ')
-    const host = c.includes(' typ host ')
-    const srflx = c.includes(' typ srflx ')
-    return { kind: 'candidate', relay, host, srflx, preview: c.slice(0, 80) }
-  }
-  return { kind: signal.type || 'signal' }
-}
+/**
+ * Native RTCPeerConnection video chat (no simple-peer).
+ *
+ * @typedef {object} VideoChatWebRTCHandle
+ * @property {() => void} destroyPeer
+ */
 
 /**
  * @param {object} props
- * @param {import('socket.io-client').Socket} props.socket
- * @param {object} [props.iceConfig] — RTCPeerConnection ICE config (STUN + TURN)
+ * @param {import('socket.io-client').Socket | null} props.socket
  * @param {string | null} props.roomId
  * @param {string | null} props.peerUserId
  * @param {boolean} props.isOfferer
- * @param {() => void} [props.onPeerDisconnected]
+ * @param {boolean} props.isSearching
  * @param {boolean} [props.micMuted]
- * @param {string} [props.localVideoFilter]
- * @param {boolean} [props.isSearching]
- * @param {boolean} [props.remoteFadeOut] — 300ms fade before tearing down peer (Omegle Next)
- * @param {number | null} [props.skipLockoutUntilMs] — wall-clock ms when Next unlocks
- * @param {number} [props.lockoutRemainingSec]
- * @param {number | null} [props.countdownDigit] — 3…1 pre-connect celebration (room not wired yet)
+ * @param {string} [props.filterId]
  */
-export default function VideoChatWebRTC({
-  socket,
-  iceConfig = ICE_SERVERS,
-  roomId,
-  peerUserId,
-  isOfferer,
-  onPeerDisconnected,
-  micMuted = false,
-  localVideoFilter = 'none',
-  remoteFadeOut = false,
-  skipLockoutUntilMs = null,
-  lockoutRemainingSec = 0,
-  countdownDigit = null,
-  isSearching = false,
-}) {
-  const localVideoRef = useRef(null)
-  useCloakEngagement(socket, roomId, localVideoRef, false)
-  const localCanvasRef = useRef(null)
+const VideoChatWebRTC = forwardRef(function VideoChatWebRTC(
+  {
+    socket,
+    roomId,
+    peerUserId,
+    isOfferer,
+    isSearching,
+    micMuted = false,
+    filterId = 'none',
+  },
+  ref,
+) {
+  const hiddenVideoRef = useRef(null)
+  const canvasRef = useRef(null)
   const remoteVideoRef = useRef(null)
-  const peerRef = useRef(null)
+  const pcRef = useRef(null)
   const localStreamRef = useRef(null)
-  const processedStreamRef = useRef(null)
-  const answererIceBufferRef = useRef([])
-  const offererIceBufferRef = useRef([])
-  const answerAppliedRef = useRef(false)
-  const connPhaseRef = useRef('connecting')
-  const autoRetryCountRef = useRef(0)
-  const offerRequestTimerRef = useRef(null)
+  const canvasStreamRef = useRef(null)
+  const remoteDescSetRef = useRef(false)
+  const pendingIceRef = useRef([])
+  const pendingOfferRef = useRef(null)
 
+  const [cameraReady, setCameraReady] = useState(false)
+  const [connStatus, setConnStatus] = useState('idle')
   const [mediaError, setMediaError] = useState(null)
-  const [hasStream, setHasStream] = useState(false)
-  const [connPhase, setConnPhase] = useState('connecting')
-  const [failureReason, setFailureReason] = useState(null)
   const [retryKey, setRetryKey] = useState(0)
 
-  useEffect(() => {
-    connPhaseRef.current = connPhase
-  }, [connPhase])
-
-  const [selectedFilter, setSelectedFilter] = useState(() => String(localVideoFilter || 'none'))
-  const [pitchEnabled, setPitchEnabled] = useState(false)
-  const [pitchSemitones, setPitchSemitones] = useState(4)
-
-  useEffect(() => {
-    setSelectedFilter(String(localVideoFilter || 'none'))
-  }, [localVideoFilter])
-
-  const { previews } = useCanvasVideoFilters({
-    videoRef: localVideoRef,
-    canvasRef: localCanvasRef,
-    enabled: true,
-    selectedFilterId: selectedFilter,
+  useCanvasVideoFilters({
+    videoRef: hiddenVideoRef,
+    canvasRef,
+    enabled: cameraReady,
+    selectedFilterId: filterId,
     virtualBgUrl: '',
   })
 
-  const selectedLabel = useMemo(
-    () => FILTERS.find((f) => f.id === selectedFilter)?.label || 'Filter',
-    [selectedFilter],
-  )
+  const attachLocalStream = useCallback((stream) => {
+    const hidden = hiddenVideoRef.current
+    if (hidden) {
+      hidden.srcObject = stream
+      hidden.muted = true
+      hidden.play?.().catch(() => {})
+    }
+  }, [])
+
+  const attachRemoteStream = useCallback((stream) => {
+    const el = remoteVideoRef.current
+    if (!el || !stream) return
+    el.srcObject = stream
+    el.muted = false
+    const p = el.play()
+    if (p?.catch) {
+      p.catch(() => {
+        el.muted = true
+        el.play().catch(() => {})
+      })
+    }
+  }, [])
 
   const destroyPeer = useCallback(() => {
-    answerAppliedRef.current = false
-    const p = peerRef.current
-    peerRef.current = null
-    if (p) {
+    remoteDescSetRef.current = false
+    pendingIceRef.current = []
+    pendingOfferRef.current = null
+    canvasStreamRef.current = null
+    const pc = pcRef.current
+    pcRef.current = null
+    if (pc) {
       try {
-        p.destroy()
+        pc.ontrack = null
+        pc.onicecandidate = null
+        pc.onconnectionstatechange = null
+        pc.close()
       } catch {
         // ignore
       }
@@ -130,44 +107,46 @@ export default function VideoChatWebRTC({
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null
     }
+    setConnStatus('idle')
   }, [])
 
-  const stopLocalStream = useCallback(() => {
-    const s = localStreamRef.current
-    localStreamRef.current = null
-    if (s) {
-      s.getTracks().forEach((t) => t.stop())
-    }
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = null
-    }
-  }, [])
+  useImperativeHandle(ref, () => ({ destroyPeer }), [destroyPeer])
 
-  const emitSignal = useCallback(
-    (data) => {
-      if (!socket?.connected || !roomId) return
-      const meta = describeSignal(data)
-      if (data.type === 'offer') {
-        console.log('[video-chat] ICE/signal sent: offer', { roomId, ...meta })
-        socket.emit('webrtc_offer', { room_id: roomId, sdp: data })
-      } else if (data.type === 'answer') {
-        console.log('[video-chat] ICE/signal sent: answer', { roomId, ...meta })
-        socket.emit('webrtc_answer', { room_id: roomId, sdp: data })
-      } else {
-        console.log('[video-chat] ICE candidate sent', { roomId, ...meta })
-        socket.emit('ice_candidate', { room_id: roomId, candidate: data })
+  const getStreamForPc = useCallback(() => {
+    const raw = localStreamRef.current
+    if (!raw) return null
+    const useFilter = filterId && filterId !== 'none'
+    const canvas = canvasRef.current
+    if (useFilter && canvas && canvas.width > 1 && canvas.height > 1) {
+      if (!canvasStreamRef.current) {
+        canvasStreamRef.current = canvas.captureStream(24)
       }
-    },
-    [socket, roomId],
-  )
+      const vTrack = canvasStreamRef.current.getVideoTracks()[0]
+      const aTrack = raw.getAudioTracks()[0]
+      if (vTrack) {
+        return new MediaStream([vTrack, aTrack].filter(Boolean))
+      }
+    }
+    return raw
+  }, [filterId])
 
+  const replaceOutgoingVideoTrack = useCallback(() => {
+    const pc = pcRef.current
+    const out = getStreamForPc()
+    if (!pc || !out) return
+    const vt = out.getVideoTracks()[0]
+    if (!vt) return
+    const sender = pc.getSenders().find((s) => s.track?.kind === 'video')
+    sender?.replaceTrack(vt).catch(() => {})
+  }, [getStreamForPc])
+
+  // 1) getUserMedia when component mounts (also when match arrives — stream ready before PC)
   useEffect(() => {
     let cancelled = false
-
     ;(async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user' },
+          video: true,
           audio: true,
         })
         if (cancelled) {
@@ -175,370 +154,254 @@ export default function VideoChatWebRTC({
           return
         }
         localStreamRef.current = stream
-        processedStreamRef.current = null
-        setHasStream(true)
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream
-        }
+        attachLocalStream(stream)
+        setCameraReady(true)
       } catch (e) {
         if (!cancelled) {
           setMediaError(e?.message || 'Could not access camera or microphone.')
-          setConnPhase('failed')
         }
       }
     })()
-
     return () => {
       cancelled = true
-      setHasStream(false)
-      stopLocalStream()
+      destroyPeer()
+      localStreamRef.current?.getTracks().forEach((t) => t.stop())
+      localStreamRef.current = null
+      setCameraReady(false)
     }
-  }, [stopLocalStream])
+  }, [attachLocalStream, destroyPeer])
 
   useEffect(() => {
     const s = localStreamRef.current
-    if (!s || !hasStream) return undefined
-    if (!pitchEnabled) {
-      processedStreamRef.current = null
-      return undefined
-    }
-
-    let cancelled = false
-    const ctx = new (window.AudioContext || window.webkitAudioContext)()
-    const source = ctx.createMediaStreamSource(s)
-    const dest = ctx.createMediaStreamDestination()
-    const proc = ctx.createScriptProcessor(1024, 1, 1)
-
-    // Keep this client-side; for now a light “distortion” using resampling.
-    // Note: This is NOT meant to anonymize/hide identity.
-    const rate = clamp(Math.pow(2, pitchSemitones / 12), 0.7, 1.5)
-    proc.onaudioprocess = (e) => {
-      if (cancelled) return
-      const input = e.inputBuffer.getChannelData(0)
-      const output = e.outputBuffer.getChannelData(0)
-      for (let i = 0; i < output.length; i += 1) {
-        const srcIndex = i * rate
-        const i0 = Math.floor(srcIndex)
-        const i1 = Math.min(input.length - 1, i0 + 1)
-        const t = srcIndex - i0
-        const a = input[i0] || 0
-        const b = input[i1] || 0
-        output[i] = a * (1 - t) + b * t
-      }
-    }
-
-    source.connect(proc)
-    proc.connect(dest)
-
-    const out = new MediaStream()
-    s.getVideoTracks().forEach((t) => out.addTrack(t))
-    dest.stream.getAudioTracks().forEach((t) => out.addTrack(t))
-    processedStreamRef.current = out
-
-    return () => {
-      cancelled = true
-      processedStreamRef.current = null
-      try {
-        proc.disconnect()
-        source.disconnect()
-      } catch {
-        // ignore
-      }
-      try {
-        ctx.close()
-      } catch {
-        // ignore
-      }
-    }
-  }, [pitchEnabled, pitchSemitones, hasStream])
-
-  useEffect(() => {
-    const s = localStreamRef.current
-    if (!s || !hasStream) return
+    if (!s) return
     s.getAudioTracks().forEach((t) => {
       t.enabled = !micMuted
     })
-  }, [micMuted, hasStream])
+  }, [micMuted, cameraReady])
 
   useEffect(() => {
-    const s = localStreamRef.current
-    if (!s || !hasStream) return
-    s.getVideoTracks().forEach((t) => {
-      t.enabled = true
-    })
-  }, [hasStream])
+    canvasStreamRef.current = null
+  }, [filterId, roomId])
 
   useEffect(() => {
-    const el = localVideoRef.current
-    if (!el) return
-    // Canvas renders the visible filtered preview; keep source element unfiltered.
-    el.style.filter = ''
-  }, [localVideoFilter])
+    if (!cameraReady || connStatus !== 'connected') return undefined
+    replaceOutgoingVideoTrack()
+    const id = window.setInterval(replaceOutgoingVideoTrack, 1000)
+    return () => window.clearInterval(id)
+  }, [filterId, cameraReady, connStatus, replaceOutgoingVideoTrack])
 
-  const inCall = Boolean(roomId && peerUserId)
-
+  // 2–7) RTCPeerConnection signaling via Socket.io
   useEffect(() => {
-    if (!socket || !roomId || !peerUserId || mediaError || !hasStream) return
-    const stream = processedStreamRef.current || localStreamRef.current
-    if (!stream) return
+    if (!socket || !roomId || !peerUserId || !cameraReady || mediaError) return undefined
 
-    const peerRole = isOfferer ? 'offerer' : 'answerer'
-    const rtcConfig = buildPeerRtcConfig(iceConfig, peerRole)
-
-    console.log('[video-chat] WebRTC starting', { roomId, peerUserId, isOfferer, retryKey })
-
-    answererIceBufferRef.current = []
-    offererIceBufferRef.current = []
-    answerAppliedRef.current = false
-
-    queueMicrotask(() => {
-      setFailureReason(null)
-      setConnPhase('connecting')
-    })
-
-    const clearOfferRequestTimer = () => {
-      if (offerRequestTimerRef.current) {
-        clearTimeout(offerRequestTimerRef.current)
-        offerRequestTimerRef.current = null
-      }
+    const localStream = getStreamForPc() || localStreamRef.current
+    if (!localStream?.getVideoTracks()?.length) {
+      setMediaError('No camera video track.')
+      return undefined
     }
 
-    if (!isOfferer) {
-      clearOfferRequestTimer()
-      offerRequestTimerRef.current = setTimeout(() => {
-        if (!peerRef.current && socket?.connected && roomId) {
-          console.log('[video-chat] answerer requesting signal replay (no offer yet)')
-          socket.emit('webrtc_request_signals', { room_id: roomId })
-        }
-      }, OFFER_REQUEST_DELAY_MS)
-    }
+    setConnStatus('connecting')
+    remoteDescSetRef.current = false
+    pendingIceRef.current = []
+    pendingOfferRef.current = null
 
-    const flushAnswererIce = () => {
-      const p = peerRef.current
-      if (!p) return
-      const buf = answererIceBufferRef.current
-      while (buf.length) {
-        const c = buf.shift()
+    const connectedRef = { current: false }
+
+    const flushPendingIce = async () => {
+      const pc = pcRef.current
+      if (!pc || !remoteDescSetRef.current) return
+      while (pendingIceRef.current.length) {
+        const c = pendingIceRef.current.shift()
         try {
-          console.log('[video-chat] flushing buffered ICE to answerer peer', describeSignal(c))
-          p.signal(c)
+          await pc.addIceCandidate(c)
         } catch (e) {
-          console.warn('[video-chat] flush answerer ICE failed', e)
+          console.warn('[webrtc] addIceCandidate failed', e)
         }
       }
     }
 
-    const flushOffererIce = () => {
-      const p = peerRef.current
-      if (!p) return
-      const buf = offererIceBufferRef.current
-      while (buf.length) {
-        const c = buf.shift()
-        try {
-          console.log('[video-chat] flushing buffered ICE to offerer peer', describeSignal(c))
-          p.signal(c)
-        } catch (e) {
-          console.warn('[video-chat] flush offerer ICE failed', e)
-        }
-      }
-    }
-
-    const applyRemoteSignal = (sdp, label) => {
-      const peer = peerRef.current
-      if (!peer) {
-        console.warn('[video-chat] no peer to apply signal', { label, type: sdp?.type })
+    const addIce = async (candidate) => {
+      const pc = pcRef.current
+      if (!pc || candidate == null) return
+      if (!remoteDescSetRef.current) {
+        pendingIceRef.current.push(candidate)
         return
       }
-      console.log('[video-chat] applying remote signal', { label, ...describeSignal(sdp) })
-      peer.signal(sdp)
-      if (isOfferer && sdp?.type === 'answer') {
-        answerAppliedRef.current = true
-        flushOffererIce()
-      }
-      if (!isOfferer && sdp?.type === 'offer') {
-        flushAnswererIce()
+      try {
+        await pc.addIceCandidate(candidate)
+      } catch (e) {
+        console.warn('[webrtc] addIceCandidate failed', e)
       }
     }
 
-    const attachPeerHandlers = (peer) => {
-      peer.on('signal', emitSignal)
-      peer.on('stream', (remoteStream) => {
-        console.log('[video-chat] peer stream event', {
-          roomId,
-          tracks: remoteStream?.getTracks?.()?.map((t) => t.kind),
+    const createPeerConnection = () => {
+      const pc = new RTCPeerConnection({
+        iceServers: ICE_SERVERS.iceServers,
+        iceCandidatePoolSize: ICE_SERVERS.iceCandidatePoolSize ?? 10,
+      })
+      pcRef.current = pc
+
+      localStream.getTracks().forEach((track) => {
+        pc.addTrack(track, localStream)
+      })
+
+      pc.ontrack = (event) => {
+        const remote = event.streams?.[0]
+        if (!remote) return
+        console.log('[webrtc] ontrack — remote stream', {
+          isOfferer,
+          tracks: remote.getTracks().map((t) => t.kind),
         })
-        autoRetryCountRef.current = 0
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = remoteStream
+        connectedRef.current = true
+        attachRemoteStream(remote)
+        setConnStatus('connected')
+      }
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate || !socket.connected) return
+        socket.emit('ice_candidate', {
+          room_id: roomId,
+          candidate: event.candidate,
+        })
+      }
+
+      pc.onconnectionstatechange = () => {
+        const st = pc.connectionState
+        console.log('[webrtc] connectionState', st, { isOfferer, roomId })
+        if (st === 'connected') {
+          connectedRef.current = true
+          setConnStatus('connected')
+        } else if (st === 'failed' || st === 'closed') {
+          setConnStatus('failed')
         }
-        setConnPhase('live')
-      })
-      peer.on('connect', () => {
-        console.log('[video-chat] peer connect event', { roomId, isOfferer })
-        autoRetryCountRef.current = 0
-        setConnPhase('live')
-      })
-      peer.on('error', (err) => {
-        console.error('[video-chat] peer error', err?.message || err)
-        setFailureReason(err?.message || 'WebRTC error')
-        setConnPhase('failed')
-      })
-      peer.on('close', () => {
-        console.warn('[video-chat] peer close event', { roomId })
-        if (connPhaseRef.current !== 'live') {
-          setConnPhase('failed')
-          setFailureReason('Connection closed.')
-        }
-      })
+      }
+
+      return pc
     }
 
-    const onOfferRelay = ({ sdp }) => {
-      if (isOfferer) return
-      clearOfferRequestTimer()
-      try {
-        applyRemoteSignal(sdp, 'offer_relay')
-      } catch (e) {
-        setFailureReason(e?.message || 'Failed to apply offer')
-        setConnPhase('failed')
-      }
+    const sendOffer = async (pc) => {
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      socket.emit('webrtc_offer', {
+        room_id: roomId,
+        sdp: pc.localDescription,
+      })
+      console.log('[webrtc] offer sent', { roomId })
     }
 
-    const onAnswerRelay = ({ sdp }) => {
-      if (!isOfferer) return
-      try {
-        applyRemoteSignal(sdp, 'answer_relay')
-      } catch (e) {
-        setFailureReason(e?.message || 'Failed to apply answer')
-        setConnPhase('failed')
-      }
-    }
-
-    const onIceRelay = ({ candidate }) => {
-      if (candidate == null) return
-      console.log('[video-chat] ICE candidate received', describeSignal(candidate))
-      const peer = peerRef.current
-      if (!peer) {
-        if (isOfferer) {
-          offererIceBufferRef.current.push(candidate)
-        } else {
-          answererIceBufferRef.current.push(candidate)
-        }
-        return
-      }
-      if (isOfferer && !answerAppliedRef.current) {
-        offererIceBufferRef.current.push(candidate)
+    const handleOffer = async (sdp) => {
+      let pc = pcRef.current
+      if (!pc) {
+        pendingOfferRef.current = sdp
         return
       }
       try {
-        peer.signal(candidate)
+        await pc.setRemoteDescription(sdp)
+        remoteDescSetRef.current = true
+        await flushPendingIce()
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        socket.emit('webrtc_answer', {
+          room_id: roomId,
+          sdp: pc.localDescription,
+        })
+        console.log('[webrtc] answer sent', { roomId })
       } catch (e) {
-        console.warn('[video-chat] apply ICE candidate failed', e)
+        console.error('[webrtc] handleOffer failed', e)
+        setConnStatus('failed')
       }
     }
 
-    const onRoomError = (err) => {
-      console.error('[video-chat] room_error', err?.message || err)
-      setFailureReason(err?.message || 'Room error')
-      setConnPhase('failed')
+    const handleAnswer = async (sdp) => {
+      const pc = pcRef.current
+      if (!pc) return
+      try {
+        await pc.setRemoteDescription(sdp)
+        remoteDescSetRef.current = true
+        await flushPendingIce()
+        console.log('[webrtc] answer applied', { roomId })
+      } catch (e) {
+        console.error('[webrtc] handleAnswer failed', e)
+        setConnStatus('failed')
+      }
     }
 
-    const onPeerDisconnectedEvt = () => {
-      destroyPeer()
-      setConnPhase('failed')
-      setFailureReason('The other participant disconnected.')
-      onPeerDisconnected?.()
+    const onOfferRelay = (payload) => {
+      if (isOfferer || payload?.room_id !== roomId) return
+      if (!pcRef.current) {
+        pendingOfferRef.current = payload.sdp
+        return
+      }
+      handleOffer(payload.sdp)
+    }
+
+    const onAnswerRelay = (payload) => {
+      if (!isOfferer || payload?.room_id !== roomId) return
+      handleAnswer(payload.sdp)
+    }
+
+    const onIceRelay = (payload) => {
+      if (payload?.room_id !== roomId) return
+      addIce(payload.candidate)
     }
 
     socket.on('webrtc_offer_relay', onOfferRelay)
     socket.on('webrtc_answer_relay', onAnswerRelay)
     socket.on('ice_candidate_relay', onIceRelay)
-    socket.on('room_error', onRoomError)
-    socket.on('webrtc_peer_disconnected', onPeerDisconnectedEvt)
 
-    if (isOfferer) {
-      console.log('[video-chat] creating offerer peer', { roomId })
-      const peer = new Peer({
-        initiator: true,
-        trickle: true,
-        stream,
-        config: rtcConfig,
-      })
-      peerRef.current = peer
-      attachPeerHandlers(peer)
-    } else {
-      console.log('[video-chat] creating answerer peer', { roomId })
-      const peer = new Peer({
-        initiator: false,
-        trickle: true,
-        stream,
-        config: rtcConfig,
-      })
-      peerRef.current = peer
-      attachPeerHandlers(peer)
-    }
+    const pc = createPeerConnection()
 
-    // Join room and request any signals exchanged before listeners were ready.
-    socket.emit('join_match_room', { room_id: roomId })
-
-    const connectTimeout = setTimeout(() => {
-      if (connPhaseRef.current !== 'connecting') return
-      if (autoRetryCountRef.current >= MAX_AUTO_RETRIES) {
-        console.error('[video-chat] WebRTC connect timeout — max retries reached', { roomId })
-        setFailureReason('Could not connect to partner. Tap Retry or find a new match.')
-        setConnPhase('failed')
-        return
+    ;(async () => {
+      if (isOfferer) {
+        await sendOffer(pc)
+      } else if (pendingOfferRef.current) {
+        await handleOffer(pendingOfferRef.current)
+        pendingOfferRef.current = null
       }
-      autoRetryCountRef.current += 1
-      console.warn('[video-chat] WebRTC connect timeout — auto retry', {
-        roomId,
-        attempt: autoRetryCountRef.current,
-      })
-      destroyPeer()
-      setRetryKey((k) => k + 1)
+
+      socket.emit('join_match_room', { room_id: roomId })
+
+      if (!isOfferer && !remoteDescSetRef.current) {
+        window.setTimeout(() => {
+          socket.emit('webrtc_request_signals', { room_id: roomId })
+        }, 1200)
+      }
+    })().catch((e) => {
+      console.error('[webrtc] setup failed', e)
+      setConnStatus('failed')
+    })
+
+    const timeout = window.setTimeout(() => {
+      if (!connectedRef.current && pcRef.current) {
+        destroyPeer()
+        setRetryKey((k) => k + 1)
+      }
     }, CONNECT_TIMEOUT_MS)
 
     return () => {
-      clearTimeout(connectTimeout)
-      clearOfferRequestTimer()
+      window.clearTimeout(timeout)
       socket.off('webrtc_offer_relay', onOfferRelay)
       socket.off('webrtc_answer_relay', onAnswerRelay)
       socket.off('ice_candidate_relay', onIceRelay)
-      socket.off('room_error', onRoomError)
-      socket.off('webrtc_peer_disconnected', onPeerDisconnectedEvt)
       destroyPeer()
     }
   }, [
     socket,
     roomId,
     peerUserId,
-    mediaError,
-    hasStream,
     isOfferer,
-    emitSignal,
-    destroyPeer,
-    onPeerDisconnected,
+    cameraReady,
+    mediaError,
     retryKey,
-    iceConfig,
+    attachRemoteStream,
+    destroyPeer,
+    getStreamForPc,
   ])
-
-  const handleRetry = () => {
-    autoRetryCountRef.current = 0
-    destroyPeer()
-    setFailureReason(null)
-    setConnPhase('connecting')
-    setRetryKey((k) => k + 1)
-  }
-
-  const lockoutActive =
-    typeof skipLockoutUntilMs === 'number' && skipLockoutUntilMs > Date.now()
 
   if (mediaError) {
     return (
       <div className="video-chat-webrtc video-chat-webrtc--error">
         <p>{mediaError}</p>
-        <button type="button" className="cta-button cta-primary" onClick={() => window.location.reload()}>
-          Reload page
-        </button>
       </div>
     )
   }
@@ -548,104 +411,36 @@ export default function VideoChatWebRTC({
       <div className="video-chat-webrtc-main">
         <video
           ref={remoteVideoRef}
-          className={`video-chat-remote ${remoteFadeOut ? 'video-chat-remote--fade-out' : ''}`}
+          className="video-chat-remote"
           playsInline
           autoPlay
-          aria-label="Remote participant video"
+          aria-label="Partner video"
         />
-        {!inCall || isSearching ? (
+        {isSearching ? (
           <div className="video-chat-search-layer">
             <MatchingParticles />
-            <p className="video-chat-search-label">
-              {typeof countdownDigit === 'number' && countdownDigit > 0
-                ? 'Match found!'
-                : 'Looking for someone…'}
-            </p>
-            {typeof countdownDigit === 'number' && countdownDigit > 0 ? (
-              <MatchCountdownOverlay digit={countdownDigit} />
-            ) : null}
+            <p className="video-chat-search-label">Looking for someone…</p>
           </div>
         ) : null}
-        {inCall && connPhase === 'connecting' ? (
+        {!isSearching && connStatus === 'connecting' ? (
           <div className="video-chat-webrtc-overlay">
-            <p>Connecting peer…</p>
+            <p>Connecting…</p>
           </div>
         ) : null}
-        {inCall && connPhase === 'failed' && failureReason ? (
+        {!isSearching && connStatus === 'failed' ? (
           <div className="video-chat-webrtc-overlay video-chat-webrtc-overlay--error">
-            <p>{failureReason}</p>
-            <div className="video-chat-webrtc-actions">
-              <button type="button" className="cta-button cta-primary" onClick={handleRetry}>
-                Retry connection
-              </button>
-            </div>
-          </div>
-        ) : null}
-        {lockoutActive ? (
-          <div className="video-chat-skip-lockout" role="status">
-            <p className="video-chat-skip-lockout-title">Next is temporarily locked</p>
-            <p className="video-chat-skip-lockout-text">
-              You have used 30 skips in the last hour. Wait{' '}
-              <strong>
-                {Math.floor(lockoutRemainingSec / 60)}:{String(lockoutRemainingSec % 60).padStart(2, '0')}
-              </strong>{' '}
-              before skipping again.
-            </p>
-          </div>
-        ) : null}
-      </div>
-      <video ref={localVideoRef} className="video-chat-local-source" playsInline autoPlay muted />
-      <canvas
-        ref={localCanvasRef}
-        className="video-chat-local-pip"
-        aria-label="Your camera"
-      />
-
-      <div className="vc-filter-strip vc-filter-strip--hidden" aria-hidden="true">
-        <div className="vc-filter-strip-head">
-          <span className="vc-filter-strip-title">{selectedLabel}</span>
-          <label className="vc-filter-voice">
-            <input
-              type="checkbox"
-              checked={pitchEnabled}
-              onChange={(e) => setPitchEnabled(e.target.checked)}
-            />
-            <span>Pitch</span>
-          </label>
-          {pitchEnabled ? (
-            <input
-              className="vc-filter-slider"
-              type="range"
-              min={-6}
-              max={8}
-              step={1}
-              value={pitchSemitones}
-              onChange={(e) => setPitchSemitones(Number(e.target.value))}
-              aria-label="Pitch shift (semitones)"
-            />
-          ) : null}
-        </div>
-        <div className="vc-filter-strip-row">
-          {(previews.length ? previews : FILTERS.map((f) => ({ ...f, dataUrl: '' }))).map((f) => (
-            <button
-              key={f.id}
-              type="button"
-              className={`vc-filter-chip ${selectedFilter === f.id ? 'is-active' : ''}`}
-              onClick={() => setSelectedFilter(f.id)}
-              title={f.label}
-            >
-              <div className="vc-filter-thumb">
-                {f.dataUrl ? <img src={f.dataUrl} alt="" /> : <div className="vc-filter-thumb-ph" />}
-              </div>
-              <div className="vc-filter-label">{f.label}</div>
+            <p>Connection failed.</p>
+            <button type="button" className="cta-button cta-primary" onClick={() => setRetryKey((k) => k + 1)}>
+              Retry
             </button>
-          ))}
-        </div>
+          </div>
+        ) : null}
       </div>
+
+      <video ref={hiddenVideoRef} className="video-chat-local-source" playsInline autoPlay muted />
+      <canvas ref={canvasRef} className="video-chat-local-pip" aria-label="Your camera" />
     </div>
   )
-}
+})
 
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n))
-}
+export default VideoChatWebRTC
